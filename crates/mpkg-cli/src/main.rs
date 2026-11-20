@@ -1,233 +1,200 @@
-use std::path::{Path, PathBuf};
+//! Command-line interface for the Rustpackages package manager.
+
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use mpkg_core::repo::{RepoEntry, RepoIndex};
-use mpkg_core::resolve;
-use mpkg_core::sign;
+use mpkg_core::lockfile::Lockfile;
+use mpkg_core::remote;
+use mpkg_core::repo::RepoIndex;
 use mpkg_core::store::Store;
-use sha2::{Digest, Sha256};
 
 #[derive(Parser)]
-#[command(name = "mpkg", version, about = "Rust-based package manager (rootfs-agnostic)")]
+#[command(name = "mpkg", version, about = "Rustpackages package manager")]
 struct Cli {
-    /// Target rootfs to operate on (defaults to /)
+    /// Target rootfs (defaults to /).
     #[arg(long, global = true, default_value = "/")]
     root: PathBuf,
-    /// Repository index file (used by search/update; defaults to <root>/etc/mpkg/index.toml)
-    #[arg(long, global = true)]
-    index: Option<PathBuf>,
-    /// Emit machine-readable JSON where supported
+    /// Machine-readable JSON output.
     #[arg(long, global = true)]
     json: bool,
+    #[command(subcommand)]
+    cmd: Command,
 }
 
 #[derive(Subcommand)]
-enum Cmd {
-    /// Install a .mpk file into the rootfs
-    Install { pkg: PathBuf },
-    /// Remove an installed package
+enum Command {
+    /// Install a local .mpk archive (or download from a repo URL).
+    Install { package: String },
+    /// Remove an installed package.
     Remove { name: String },
-    /// Upgrade installed packages to the newest versions in the index
-    Upgrade,
-    /// List installed packages
+    /// Upgrade installed packages to the newest versions in a repo.
+    Upgrade { repo: Option<String> },
+    /// List installed packages.
     List,
-    /// Verify installed files against recorded hashes
-    Verify { name: String },
-    /// Search the repository index
-    Search { query: String },
-    /// Refresh the local copy of the repository index
-    Update,
-    /// Show install/remove history
+    /// Verify installed files against recorded hashes.
+    Verify { name: Option<String> },
+    /// Search a repository index.
+    Search { repo: String, query: String },
+    /// Fetch and cache a remote repo index.
+    Update { repo: String },
+    /// Show operation history.
     History,
-    /// Undo the most recent operation
+    /// Undo the last operation.
     Rollback,
-    /// Manage repositories
+    /// Manage repositories.
     Repo {
         #[command(subcommand)]
-        action: RepoCmd,
+        action: RepoCommand,
     },
-    /// Generate an ed25519 keypair for signing repo indexes
-    Keygen,
+    /// Generate an ed25519 signing keypair.
+    Keygen { name: String },
 }
 
 #[derive(Subcommand)]
-enum RepoCmd {
+enum RepoCommand {
     Add { name: String, url: String },
     List,
 }
 
-fn index_path(cli: &Cli) -> PathBuf {
-    cli.index
-        .clone()
-        .unwrap_or_else(|| cli.root.join("etc/mpkg/index.toml"))
-}
-
-fn load_index(cli: &Cli) -> Result<RepoIndex> {
-    RepoIndex::load(&index_path(cli)).context("failed to load repository index (run `mpkg update` first)")
-}
-
-fn download(url: &str) -> Result<Vec<u8>> {
-    // Minimal HTTP(S) fetch without extra deps is out of scope; support
-    // file:// and plain paths for now, bail clearly otherwise.
-    let path = url
-        .strip_prefix("file://")
-        .unwrap_or(url);
-    if Path::new(path).is_file() {
-        Ok(std::fs::read(path)?)
-    } else {
-        bail!("remote fetching not yet implemented; use a file:// URL (got {})", url)
-    }
-}
-
-fn fetch_pkg(entry: &RepoEntry) -> Result<(PathBuf, Vec<u8>)> {
-    let data = download(&entry.url)?;
-    let actual = hex::encode(Sha256::digest(&data));
-    if actual != entry.sha256 {
-        bail!("sha256 mismatch for {}: expected {}, got {}", entry.name, entry.sha256, actual);
-    }
-    let tmp = std::env::temp_dir().join(format!("{}-{}.mpk", entry.name, entry.version));
-    std::fs::write(&tmp, &data)?;
-    Ok((tmp, data))
-}
-
 fn main() -> ExitCode {
-    match run() {
+    let cli = Cli::parse();
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {:#}", e);
+            eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> mpkg_core::Result<()> {
     let store = Store::new(&cli.root);
-    match &cli.cmd {
-        Cmd::Install { pkg } => {
-            let rec = store.install(pkg)?;
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&rec)?);
+    match cli.cmd {
+        Command::Install { package } => {
+            let path = if package.starts_with("http://") || package.starts_with("https://") || package.starts_with("file://") {
+                let tmp = cli.root.join("var/lib/mpkg/cache");
+                let name_ver = package.rsplit('/').next().unwrap_or("pkg.mpk").to_string();
+                let (name, version) = name_ver
+                    .trim_end_matches(".mpk")
+                    .rsplit_once('-')
+                    .map(|(n, v)| (n.to_string(), v.to_string()))
+                    .unwrap_or((name_ver.clone(), String::new()));
+                remote::fetch_package(&package[..package.rfind('/').unwrap_or(0)], &name, &version, &tmp)?
             } else {
-                println!("installed {} {}", rec.manifest.package.name, rec.manifest.package.version);
+                PathBuf::from(&package)
+            };
+            let rec = store.install(&path)?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&rec).unwrap());
+            } else {
+                println!("installed {} {}", rec.manifest.name, rec.manifest.version);
             }
         }
-        Cmd::Remove { name } => {
-            store.remove(name)?;
-            if !cli.json {
-                println!("removed {}", name);
-            }
+        Command::Remove { name } => {
+            let rec = store.remove(&name)?;
+            println!("removed {} {}", rec.manifest.name, rec.manifest.version);
         }
-        Cmd::Upgrade => {
-            let index = load_index(&cli)?;
+        Command::Upgrade { repo } => {
+            let repo_url = repo.ok_or_else(|| mpkg_core::MpkgError::Parse("upgrade requires a repo URL".into()))?;
+            let index = remote::fetch_index(&repo_url)?;
             let installed = store.list()?;
             let mut upgraded = 0;
-            for pkg in &installed {
-                let name = &pkg.manifest.package.name;
-                let cur = semver::Version::parse(&pkg.manifest.package.version)?;
-                if let Some(entry) = index.find(name, &semver::VersionReq::STAR) {
-                    let new = semver::Version::parse(&entry.version)?;
-                    if new > cur {
-                        let (tmp, _) = fetch_pkg(&entry)?;
-                        store.install(&tmp)?;
+            for pkg in installed {
+                if let Some(latest) = index.find(&pkg.manifest.name) {
+                    if latest.version != pkg.manifest.version {
+                        let tmp = cli.root.join("var/lib/mpkg/cache");
+                        let mpk = remote::fetch_package(&repo_url, &latest.name, &latest.version, &tmp)?;
+                        store.remove(&pkg.manifest.name)?;
+                        store.install(&mpk)?;
                         upgraded += 1;
-                        if !cli.json {
-                            println!("upgraded {} {} -> {}", name, cur, new);
-                        }
+                        println!("upgraded {} {} -> {}", latest.name, pkg.manifest.version, latest.version);
                     }
                 }
             }
-            if !cli.json && upgraded == 0 {
+            if upgraded == 0 {
                 println!("everything up to date");
             }
         }
-        Cmd::List => {
-            let list = store.list()?;
+        Command::List => {
+            let pkgs = store.list()?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&list)?);
+                println!("{}", serde_json::to_string(&pkgs).unwrap());
             } else {
-                for p in list {
-                    println!("{}\t{}", p.manifest.package.name, p.manifest.package.version);
+                for p in pkgs {
+                    println!("{} {}", p.manifest.name, p.manifest.version);
                 }
             }
         }
-        Cmd::Verify { name } => {
-            let problems = store.verify(name)?;
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&problems)?);
-            } else if problems.is_empty() {
-                println!("{}: OK", name);
-            } else {
-                for p in problems {
-                    println!("{}", p);
-                }
-                bail!("{} failed verification", name);
-            }
-        }
-        Cmd::Search { query } => {
-            let index = load_index(&cli)?;
-            let hits = index.search(query);
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&hits)?);
-            } else {
-                for h in hits {
-                    println!("{}\t{}\t{}", h.name, h.version, h.description);
-                }
-            }
-        }
-        Cmd::Update => {
-            // With file:// repos the index is already local; copy it into place.
-            println!("index at {}", index_path(&cli).display());
-        }
-        Cmd::History => {
-            let h = store.history()?;
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&h)?);
-            } else {
-                for e in h {
-                    println!("{}\t{}\t{} {}", e.at, e.op, e.name, e.version);
-                }
-            }
-        }
-        Cmd::Rollback => {
-            let e = store.rollback()?;
-            if !cli.json {
-                println!("rolled back {} {} {}", e.op, e.name, e.version);
-            }
-        }
-        Cmd::Repo { action } => match action {
-            RepoCmd::Add { name, url } => {
-                let path = cli.root.join("etc/mpkg/repos.toml");
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let mut content = if path.is_file() {
-                    std::fs::read_to_string(&path)?
+        Command::Verify { name } => {
+            let names: Vec<String> = match name {
+                Some(n) => vec![n],
+                None => store.list()?.iter().map(|p| p.manifest.name.clone()).collect(),
+            };
+            let mut bad = 0;
+            for n in names {
+                let mismatches = store.verify(&n)?;
+                if mismatches.is_empty() {
+                    println!("{n}: OK");
                 } else {
-                    String::new()
-                };
-                content.push_str(&format!("[[repo]]\nname = \"{}\"\nurl = \"{}\"\n\n", name, url));
-                std::fs::write(&path, content)?;
-                if !cli.json {
-                    println!("added repo {} ({})", name, url);
+                    bad += 1;
+                    println!("{n}: {} file(s) modified/missing", mismatches.len());
                 }
             }
-            RepoCmd::List => {
-                let path = cli.root.join("etc/mpkg/repos.toml");
-                if path.is_file() {
-                    print!("{}", std::fs::read_to_string(&path)?);
+            if bad > 0 {
+                return Err(mpkg_core::MpkgError::VerifyFailed(bad));
+            }
+        }
+        Command::Search { repo, query } => {
+            let index = remote::fetch_index(&repo)?;
+            for p in index.search(&query) {
+                println!("{} {} — {}", p.name, p.version, p.description);
+            }
+        }
+        Command::Update { repo } => {
+            let index = remote::fetch_index(&repo)?;
+            let dir = cli.root.join("var/lib/mpkg/repos");
+            std::fs::create_dir_all(&dir).map_err(mpkg_core::MpkgError::Io)?;
+            let name = repo.rsplit('/').next().unwrap_or("repo").trim_end_matches(".git").to_string();
+            index.save(&dir.join(format!("{name}.toml")))?;
+            println!("updated index for {repo} ({} packages)", index.packages.len());
+        }
+        Command::History => {
+            let path = cli.root.join("var/lib/mpkg/history.jsonl");
+            match std::fs::read_to_string(&path) {
+                Ok(text) => print!("{text}"),
+                Err(_) => println!("(no history)"),
+            }
+        }
+        Command::Rollback => {
+            let entry = store.rollback()?;
+            println!("rolled back {} {}", entry.name(), entry.version());
+        }
+        Command::Repo { action } => match action {
+            RepoCommand::Add { name, url } => {
+                let dir = cli.root.join("var/lib/mpkg/repos");
+                std::fs::create_dir_all(&dir).map_err(mpkg_core::MpkgError::Io)?;
+                let mut cfg: toml::Value = match std::fs::read_to_string(dir.join("repos.toml")) {
+                    Ok(t) => toml::from_str(&t).unwrap_or(toml::Value::Table(Default::default())),
+                    Err(_) => toml::Value::Table(Default::default()),
+                };
+                cfg["repos"][name.as_str()] = toml::Value::String(url);
+                std::fs::write(dir.join("repos.toml"), toml::to_string_pretty(&cfg).unwrap()).map_err(mpkg_core::MpkgError::Io)?;
+                println!("added repo {name} -> {url}");
+            }
+            RepoCommand::List => {
+                let path = cli.root.join("var/lib/mpkg/repos/repos.toml");
+                match std::fs::read_to_string(&path) {
+                    Ok(t) => print!("{t}"),
+                    Err(_) => println!("(no repos configured)"),
                 }
             }
         },
-        Cmd::Keygen => {
-            let (sk, pk) = sign::generate_keypair();
-            if cli.json {
-                println!("{{\"secret\": \"{}\", \"public\": \"{}\"}}", sk, pk);
-            } else {
-                println!("secret: {}\npublic: {}", sk, pk);
-            }
+        Command::Keygen { name } => {
+            let dir = cli.root.join("var/lib/mpkg/keys");
+            let (pk, sk) = mpkg_core::sign::generate_keypair();
+            mpkg_core::sign::save_keypair(&dir, &name, &pk, &sk)?;
+            println!("wrote keypair to {}", dir.join(&name).display());
         }
     }
     Ok(())

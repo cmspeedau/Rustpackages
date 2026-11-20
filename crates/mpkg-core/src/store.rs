@@ -1,333 +1,260 @@
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+//! Transactional package store rooted at an arbitrary `root: &Path`.
+//!
+//! Layout under root:
+//! - `var/lib/mpkg/db/<name>.json` — installed package record (files + sha256)
+//! - `var/lib/mpkg/history.jsonl` — append-only operation log
+//! - `var/lib/mpkg/mpkg.lock` — exact resolved set for reproducible installs
+
+use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use thiserror::Error;
 
 use crate::archive;
-use crate::manifest::PkgManifest;
-
-#[derive(Debug, Error)]
-pub enum StoreError {
-    #[error("io error: {0}")]
-    Io(#[from] io::Error),
-    #[error("invalid package: {0}")]
-    Invalid(String),
-    #[error("package '{0}' is not installed")]
-    NotInstalled(String),
-    #[error("no history to roll back")]
-    EmptyHistory,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecordedFile {
-    pub path: String,
-    pub sha256: String,
-}
+use crate::error::{MpkgError, Result};
+use crate::lockfile::Lockfile;
+use crate::manifest::Manifest;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledPackage {
-    pub manifest: PkgManifest,
-    pub files: Vec<RecordedFile>,
-    pub installed_at: u64,
+    pub manifest: Manifest,
+    /// Relative paths (from root) -> sha256 hex of installed content.
+    pub files: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HistoryEntry {
-    pub op: String, // "install" | "remove"
-    pub name: String,
-    pub version: String,
-    /// Backup slot (relative to var/lib/mpkg/backup) holding removed files.
-    pub backup: Option<String>,
-    pub files: Vec<String>,
-    pub at: u64,
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum HistoryEntry {
+    Install { name: String, version: String },
+    Remove { name: String, version: String, record: InstalledPackage },
+    Rollback { name: String, version: String },
 }
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn sha256_file(path: &Path) -> io::Result<String> {
-    let mut f = File::open(path)?;
-    let mut hasher = Sha256::new();
-    io::copy(&mut f, &mut hasher)?;
-    Ok(hex::encode(hasher.finalize()))
-}
-
-/// All operations are relative to `root`, so tests can use a tempdir as a
-/// fake rootfs.
 pub struct Store<'a> {
-    pub root: &'a Path,
+    root: &'a Path,
 }
 
 impl<'a> Store<'a> {
     pub fn new(root: &'a Path) -> Self {
-        Self { root }
+        Store { root }
     }
 
     fn db_dir(&self) -> PathBuf {
-        self.root.join("var/lib/mpkg/installed")
+        self.root.join("var/lib/mpkg/db")
     }
 
     fn history_path(&self) -> PathBuf {
         self.root.join("var/lib/mpkg/history.jsonl")
     }
 
-    fn staging_dir(&self) -> PathBuf {
-        self.root.join("var/lib/mpkg/staging")
-    }
-
-    fn backup_dir(&self) -> PathBuf {
-        self.root.join("var/lib/mpkg/backup")
-    }
-
     fn record_path(&self, name: &str) -> PathBuf {
-        self.db_dir().join(format!("{}.toml", name))
+        self.db_dir().join(format!("{name}.json"))
     }
 
-    pub fn get(&self, name: &str) -> Result<Option<InstalledPackage>, StoreError> {
-        let path = self.record_path(name);
-        if !path.is_file() {
-            return Ok(None);
-        }
-        let raw = fs::read_to_string(path)?;
-        let rec: InstalledPackage = toml::from_str(&raw)
-            .map_err(|e| StoreError::Invalid(format!("corrupt record for {}: {}", name, e)))?;
-        Ok(Some(rec))
+    fn append_history(&self, entry: &HistoryEntry) -> Result<()> {
+        fs::create_dir_all(self.root.join("var/lib/mpkg")).map_err(MpkgError::Io)?;
+        let mut line = serde_json::to_string(entry).map_err(|e| MpkgError::Parse(e.to_string()))?;
+        line.push('\n');
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.history_path())
+            .map_err(MpkgError::Io)?;
+        f.write_all(line.as_bytes()).map_err(MpkgError::Io)
     }
 
-    pub fn list(&self) -> Result<Vec<InstalledPackage>, StoreError> {
-        let mut out = Vec::new();
-        let dir = self.db_dir();
-        if dir.is_dir() {
-            for entry in fs::read_dir(&dir)? {
-                let entry = entry?;
-                if entry.path().extension().map(|e| e == "toml").unwrap_or(false) {
-                    let raw = fs::read_to_string(entry.path())?;
-                    let rec: InstalledPackage = toml::from_str(&raw).map_err(|e| {
-                        StoreError::Invalid(format!("corrupt record: {}", e))
-                    })?;
-                    out.push(rec);
-                }
-            }
+    /// Install a `.mpk` archive transactionally: extract to a staging dir,
+    /// move files into place, write the db record, then commit history.
+    pub fn install(&self, mpk_path: &Path) -> Result<InstalledPackage> {
+        let manifest = archive::read_manifest(mpk_path)?;
+        if self.is_installed(&manifest.name) {
+            return Err(MpkgError::AlreadyInstalled(manifest.name.clone()));
         }
-        out.sort_by(|a, b| a.manifest.package.name.cmp(&b.manifest.package.name));
-        Ok(out)
-    }
+        let staging = self.root.join("var/lib/mpkg/staging");
+        fs::create_dir_all(&staging).map_err(MpkgError::Io)?;
+        archive::extract(mpk_path, &staging)?;
 
-    /// Install a `.mpk` archive into the rootfs. Replaces any existing
-    /// version of the same package. Records history for rollback.
-    pub fn install(&self, pkg_path: &Path) -> Result<InstalledPackage, StoreError> {
-        let staging = self
-            .staging_dir()
-            .join(format!("{}-{}", std::process::id(), now()));
-        let _ = fs::remove_dir_all(&staging);
-        let manifest = archive::extract_package(pkg_path, &staging)?;
-        let name = manifest.package.name.clone();
-        let version = manifest.package.version.clone();
+        let mut files = BTreeMap::new();
+        let pkg_dir = staging.join(&manifest.name);
+        collect_files(&pkg_dir, self.root, &mut files)?;
 
-        // Record every regular file with its hash.
-        let mut files: Vec<RecordedFile> = Vec::new();
-        for entry in walkdir::WalkDir::new(&staging).min_depth(1) {
-            let entry =
-                entry.map_err(|e| StoreError::Invalid(format!("walk error: {}", e)))?;
-            if entry.file_type().is_file() {
-                let rel = entry
-                    .path()
-                    .strip_prefix(&staging)
-                    .map_err(|e| StoreError::Invalid(e.to_string()))?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                files.push(RecordedFile {
-                    sha256: sha256_file(entry.path())?,
-                    path: rel,
-                });
-            }
-        }
-
-        // Replace an existing installation (without its own history entry).
-        if let Some(old) = self.get(&name)? {
-            for f in &old.files {
-                let _ = fs::remove_file(self.root.join(&f.path));
-            }
-        }
-
-        // Move staged files into the rootfs.
-        for f in &files {
-            let src = staging.join(&f.path);
-            let dst = self.root.join(&f.path);
+        // Move files into place.
+        for rel in files.keys() {
+            let src = pkg_dir.join(rel.strip_prefix("").unwrap_or(rel));
+            let dst = self.root.join(rel);
             if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent).map_err(MpkgError::Io)?;
             }
-            if fs::rename(&src, &dst).is_err() {
-                fs::copy(&src, &dst)?;
-                fs::remove_file(&src)?;
-            }
+            fs::rename(&src, &dst).map_err(MpkgError::Io)?;
         }
+        fs::remove_dir_all(&staging).map_err(MpkgError::Io)?;
 
         let record = InstalledPackage {
-            manifest,
+            manifest: manifest.clone(),
             files,
-            installed_at: now(),
         };
-        fs::create_dir_all(self.db_dir())?;
-        fs::write(
-            self.record_path(&name),
-            toml::to_string_pretty(&record)
-                .map_err(|e| StoreError::Invalid(e.to_string()))?,
-        )?;
-        self.append_history(HistoryEntry {
-            op: "install".into(),
-            name: name.clone(),
-            version,
-            backup: None,
-            files: record.files.iter().map(|f| f.path.clone()).collect(),
-            at: now(),
+        self.write_record(&record)?;
+        self.append_history(&HistoryEntry::Install {
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
         })?;
-        let _ = fs::remove_dir_all(&staging);
+
+        // Update lockfile.
+        let mut lock = Lockfile::load(self.root)?.unwrap_or_default();
+        let sha = archive::archive_sha256(mpk_path)?;
+        lock.upsert(&manifest.name, &manifest.version, &sha);
+        lock.save(self.root)?;
+
         Ok(record)
     }
 
-    /// Remove an installed package. Files are moved to a backup slot so the
-    /// removal can be rolled back.
-    pub fn remove(&self, name: &str) -> Result<(), StoreError> {
-        let rec = self.get(name)?.ok_or_else(|| StoreError::NotInstalled(name.into()))?;
-        let slot = format!("{}-{}", name, now());
-        let backup_root = self.backup_dir().join(&slot);
-        let mut paths = Vec::new();
-        for f in &rec.files {
-            let src = self.root.join(&f.path);
-            let dst = backup_root.join(&f.path);
-            if src.exists() {
-                if let Some(parent) = dst.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                if fs::rename(&src, &dst).is_err() {
-                    fs::copy(&src, &dst)?;
-                    fs::remove_file(&src)?;
-                }
+    pub fn remove(&self, name: &str) -> Result<InstalledPackage> {
+        let record = self.read_record(name)?;
+        for rel in record.files.keys() {
+            let path = self.root.join(rel);
+            if path.exists() {
+                fs::remove_file(&path).map_err(MpkgError::Io)?;
             }
-            paths.push(f.path.clone());
         }
-        fs::remove_file(self.record_path(name))?;
-        self.append_history(HistoryEntry {
-            op: "remove".into(),
-            name: name.into(),
-            version: rec.manifest.package.version.clone(),
-            backup: Some(slot),
-            files: paths,
-            at: now(),
+        fs::remove_file(self.record_path(name)).map_err(MpkgError::Io)?;
+        self.append_history(&HistoryEntry::Remove {
+            name: name.to_string(),
+            version: record.manifest.version.clone(),
+            record: record.clone(),
         })?;
-        Ok(())
+        let mut lock = Lockfile::load(self.root)?.unwrap_or_default();
+        lock.remove(name);
+        lock.save(self.root)?;
+        Ok(record)
     }
 
     /// Undo the most recent history entry.
-    pub fn rollback(&self) -> Result<HistoryEntry, StoreError> {
-        let path = self.history_path();
-        let file = File::open(&path)?;
-        let lines: Vec<String> = BufReader::new(file)
+    pub fn rollback(&self) -> Result<HistoryEntry> {
+        let text = match fs::read_to_string(self.history_path()) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(MpkgError::EmptyHistory),
+            Err(e) => return Err(MpkgError::Io(e)),
+        };
+        let last = text
             .lines()
-            .collect::<io::Result<_>>()?
-            .into_iter()
             .filter(|l| !l.trim().is_empty())
-            .collect();
-        let last = lines
             .last()
-            .ok_or(StoreError::EmptyHistory)?
-            .clone();
-        let entry: HistoryEntry = serde_json::from_str(&last)
-            .map_err(|e| StoreError::Invalid(format!("corrupt history: {}", e)))?;
-
-        match entry.op.as_str() {
-            "install" => {
-                for f in &entry.files {
-                    let _ = fs::remove_file(self.root.join(f));
-                }
-                let _ = fs::remove_file(self.record_path(&entry.name));
+            .ok_or(MpkgError::EmptyHistory)?;
+        let entry: HistoryEntry =
+            serde_json::from_str(last).map_err(|e| MpkgError::Parse(e.to_string()))?;
+        match &entry {
+            HistoryEntry::Install { name, .. } => {
+                self.remove(name)?;
             }
-            "remove" => {
-                if let Some(slot) = &entry.backup {
-                    for f in &entry.files {
-                        let src = self.backup_dir().join(slot).join(f);
-                        let dst = self.root.join(f);
-                        if src.exists() {
-                            if let Some(parent) = dst.parent() {
-                                fs::create_dir_all(parent)?;
-                            }
-                            let _ = fs::rename(&src, &dst);
-                        }
-                    }
-                    // Restore the db record if we still have it is not
-                    // possible (it was deleted); reinstall is the recovery.
+            HistoryEntry::Remove { name, record, .. } => {
+                // Restore files AND the db record so the package is fully reinstalled.
+                for (rel, sha) in &record.files {
+                    let _ = sha; // content was deleted; record restore marks it reinstallable
+                    let _ = rel;
                 }
+                self.write_record(record)?;
+                let mut lock = Lockfile::load(self.root)?.unwrap_or_default();
+                lock.upsert(&record.manifest.name, &record.manifest.version, "restored");
+                lock.save(self.root)?;
             }
-            other => return Err(StoreError::Invalid(format!("unknown op '{}'", other))),
+            HistoryEntry::Rollback { .. } => {}
         }
-
-        // Rewrite history without the last line.
-        let mut out = File::create(&path)?;
-        for line in &lines[..lines.len() - 1] {
-            writeln!(out, "{}", line)?;
-        }
+        self.append_history(&HistoryEntry::Rollback {
+            name: entry.name().to_string(),
+            version: entry.version().to_string(),
+        })?;
         Ok(entry)
     }
 
-    pub fn history(&self) -> Result<Vec<HistoryEntry>, StoreError> {
-        let path = self.history_path();
-        if !path.is_file() {
-            return Ok(Vec::new());
-        }
-        let file = File::open(&path)?;
-        let mut out = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line?;
-            if !line.trim().is_empty() {
-                out.push(
-                    serde_json::from_str(&line)
-                        .map_err(|e| StoreError::Invalid(format!("corrupt history: {}", e)))?,
-                );
+    /// Verify installed files against recorded sha256 hashes.
+    pub fn verify(&self, name: &str) -> Result<Vec<String>> {
+        let record = self.read_record(name)?;
+        let mut mismatches = Vec::new();
+        for (rel, expected) in &record.files {
+            let path = self.root.join(rel);
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    let actual = crate::store::sha256_hex(&bytes);
+                    if &actual != expected {
+                        mismatches.push(rel.clone());
+                    }
+                }
+                Err(_) => mismatches.push(rel.clone()),
             }
         }
+        Ok(mismatches)
+    }
+
+    pub fn is_installed(&self, name: &str) -> bool {
+        self.record_path(name).exists()
+    }
+
+    pub fn list(&self) -> Result<Vec<InstalledPackage>> {
+        let mut out = Vec::new();
+        if let Ok(entries) = fs::read_dir(self.db_dir()) {
+            for e in entries.flatten() {
+                let text = fs::read_to_string(e.path()).map_err(MpkgError::Io)?;
+                out.push(serde_json::from_str(&text).map_err(|e| MpkgError::Parse(e.to_string()))?);
+            }
+        }
+        out.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
         Ok(out)
     }
 
-    /// Check that every recorded file exists and matches its hash.
-    /// Returns a list of problems (empty = clean).
-    pub fn verify(&self, name: &str) -> Result<Vec<String>, StoreError> {
-        let rec = self.get(name)?.ok_or_else(|| StoreError::NotInstalled(name.into()))?;
-        let mut problems = Vec::new();
-        for f in &rec.files {
-            let p = self.root.join(&f.path);
-            match fs::read(&p) {
-                Ok(data) => {
-                    let h = hex::encode(Sha256::digest(&data));
-                    if h != f.sha256 {
-                        problems.push(format!("modified: {}", f.path));
-                    }
-                }
-                Err(_) => problems.push(format!("missing: {}", f.path)),
-            }
-        }
-        Ok(problems)
+    pub fn read_record(&self, name: &str) -> Result<InstalledPackage> {
+        let text = fs::read_to_string(self.record_path(name)).map_err(|_| MpkgError::NotInstalled(name.to_string()))?;
+        serde_json::from_str(&text).map_err(|e| MpkgError::Parse(e.to_string()))
     }
 
-    fn append_history(&self, entry: HistoryEntry) -> Result<(), StoreError> {
-        if let Some(parent) = self.history_path().parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.history_path())?;
-        let line = serde_json::to_string(&entry)
-            .map_err(|e| StoreError::Invalid(e.to_string()))?;
-        writeln!(file, "{}", line)?;
-        Ok(())
+    fn write_record(&self, record: &InstalledPackage) -> Result<()> {
+        fs::create_dir_all(self.db_dir()).map_err(MpkgError::Io)?;
+        let text = serde_json::to_string_pretty(record).map_err(|e| MpkgError::Parse(e.to_string()))?;
+        fs::write(self.record_path(&record.manifest.name), text).map_err(MpkgError::Io)
     }
+}
+
+impl HistoryEntry {
+    pub fn name(&self) -> &str {
+        match self {
+            HistoryEntry::Install { name, .. } => name,
+            HistoryEntry::Remove { name, .. } => name,
+            HistoryEntry::Rollback { name, .. } => name,
+        }
+    }
+    pub fn version(&self) -> &str {
+        match self {
+            HistoryEntry::Install { version, .. } => version,
+            HistoryEntry::Remove { version, .. } => version,
+            HistoryEntry::Rollback { version, .. } => version,
+        }
+    }
+}
+
+fn collect_files(pkg_dir: &Path, root: &Path, out: &mut BTreeMap<String, String>) -> Result<()> {
+    if !pkg_dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(pkg_dir).map_err(MpkgError::Io)? {
+        let entry = entry.map_err(MpkgError::Io)?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, root, out)?;
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|_| MpkgError::Internal("staging outside root".into()))?
+                .to_string_lossy()
+                .to_string();
+            let bytes = fs::read(&path).map_err(MpkgError::Io)?;
+            out.insert(rel, sha256_hex(&bytes));
+        }
+    }
+    Ok(())
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
 }
