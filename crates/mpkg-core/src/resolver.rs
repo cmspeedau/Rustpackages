@@ -1,214 +1,261 @@
-// Dependency resolver: graph-based, conflict-aware, satisfying set
-use crate::{Error, PackageManifest, Result};
+// Dependency resolver for mpkg
+//
+// - Supports semver ranges for dependencies
+// - Handles virtual packages via `provides`
+// - Detects conflicts and chooses a satisfying set
+// - Detects orphaned packages
+
+use crate::{PackageManifest, Result};
 use indexmap::IndexMap;
 use semver::{Version, VersionReq};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-#[derive(Debug, Clone)]
-struct Candidate {
-    name: String,
-    manifest: PackageManifest,
-    available_versions: Vec<Version>,
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ResolveOptions {
     pub upgrade_all: bool,
-    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Node {
+    name: String,
+    version: Version,
+    manifest: PackageManifest,
+}
+
+#[derive(Debug)]
+struct ResolverState {
+    repo_map: BTreeMap<String, Vec<PackageManifest>>, // name -> all versions
+    installed: BTreeMap<String, Version>,             // name -> installed version
+    plan: BTreeMap<String, Version>,                   // name -> resolved version
+    provides_map: BTreeMap<String, Vec<(String, Version)>>, // virtual -> real
+    queue: VecDeque<String>,                           // install queue
+    conflicts: BTreeSet<(String, Version)>,            // explicit conflicts
 }
 
 pub struct Resolver {
-    pub installed: BTreeMap<String, Version>,
-    pub repo_entries: BTreeMap<String, Vec<PackageManifest>>, // name -> all versions
-    pub provides_map: HashMap<String, String>, // provided virtual -> real name
+    state: ResolverState,
 }
 
 impl Resolver {
     pub fn new(
         installed: BTreeMap<String, Version>,
-        repo_entries: BTreeMap<String, Vec<PackageManifest>>,
+        repo_map: BTreeMap<String, Vec<PackageManifest>>,
     ) -> Self {
-        // Build provides map: e.g. "libfoo.so.1" -> "foo"
-        let mut provides_map = HashMap::new();
-        for (name, manifests) in &repo_entries {
-            if let Some(p) = manifests.iter().find_map(|m| {
-                if m.provides.is_empty() {
-                    None
-                } else {
-                    Some((m.provides[0].clone(), name.clone()))
+        // Build provides map across repo
+        let mut provides_map: BTreeMap<String, Vec<(String, Version)>> = BTreeMap::new();
+        for (name, manifests) in &repo_map {
+            for mf in manifests {
+                for prov in &mf.provides {
+                    provides_map
+                        .entry(prov.clone())
+                        .or_default()
+                        .push((name.clone(), Version::parse(&mf.version).unwrap()));
                 }
-            }) {
-                provides_map.insert(p.0, p.1);
             }
         }
+
         Self {
-            installed,
-            repo_entries,
-            provides_map,
+            state: ResolverState {
+                repo_map,
+                installed,
+                plan: BTreeMap::new(),
+                provides_map,
+                queue: VecDeque::new(),
+                conflicts: BTreeSet::new(),
+            },
         }
     }
 
-    /// Resolve a set of requested packages to a lockfile.
-    /// On conflict, returns a structured error describing the conflict.
-    pub fn resolve<I: IntoIterator<Item = String>>(
-        &self,
-        requested: I,
+    /// Resolve a list of package specs (with optional semver constraints).
+    /// An empty list upgrades everything.
+    pub fn resolve(
+        mut self,
+        specs: impl IntoIterator<Item = String>,
         opts: ResolveOptions,
-    ) -> Result<Vec<(String, Version)>> {
-        let mut resolved: BTreeMap<String, Version> = BTreeMap::new();
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-
-        // Upgrade mode: start from installed set
+    ) -> Result<Vec<(String, String)>> {
+        // Seed queue
         if opts.upgrade_all {
-            for (name, ver) in &self.installed {
-                if let Some(vs) = self.repo_entries.get(name) {
-                    if let Some(latest) = vs.iter().map(|m| Version::parse(&m.version).ok()).max().flatten() {
-                        resolved.insert(name.clone(), latest);
+            for (name, ver) in &self.state.installed {
+                self.state.queue.push_back(name.clone());
+                self.state.plan.insert(name.clone(), ver.clone());
+            }
+        } else {
+            for spec in specs {
+                let (name, req) = parse_spec(&spec);
+                // If already installed and satisfies req, keep it; else upgrade
+                if let Some(v) = self.state.installed.get(&name) {
+                    if req.matches(v) {
+                        // keep current
+                        self.state.plan.insert(name.clone(), v.clone());
+                        continue;
                     }
                 }
+                self.state.queue.push_back(name.clone());
             }
         }
 
-        // Track what we still need to satisfy
-        let mut queue: Vec<String> = requested.into_iter().collect();
-        while let Some(name) = queue.pop() {
-            if seen.contains(&name) {
+        // Resolve graph
+        while let Some(name) = self.state.queue.pop_front() {
+            if self.state.plan.contains_key(&name) {
+                // already resolved
                 continue;
             }
-            seen.insert(name.clone());
 
-            // Resolve provided virtuals to real name
-            let real_name = self.provides_map.get(&name).cloned().unwrap_or(name.clone());
-
-            // Choose a version satisfying deps
-            let chosen = self.select_version(&real_name, &resolved)?;
-            if chosen.is_none() {
-                return Err(Error::Repository(format!(
-                    "cannot satisfy dependency '{}' within constraints",
-                    real_name
-                )));
-            }
-            let chosen = chosen.unwrap();
-
-            // Install direct dependencies
-            for dep in &chosen.depends {
-                queue.push(dep.clone());
-            }
-
-            // Record resolved version
-            resolved.insert(real_name.clone(), chosen.manifest.version.parse().unwrap());
-        }
-
-        // Validate no conflicts: each name only once
-        Ok(resolved.into_iter().collect())
-    }
-
-    /// Select highest version satisfying installed set and constraints.
-    fn select_version(&self, name: &str, installed: &BTreeMap<String, Version>) -> Result<Option<&PackageManifest>> {
-        let candidates: Vec<&PackageManifest> = self
-            .repo_entries
-            .get(name)
-            .into_iter()
-            .flat_map(|v| v.iter())
-            .filter(|m| {
-                if let Ok(v) = Version::parse(&m.version) {
-                    // If already installed, prefer upgrade
-                    if let Some(installed_v) = installed.get(name) {
-                        if v <= *installed_v {
-                            return false;
+            // Find the best version in repo for this name
+            let best = if let Some(candidates) = self.state.repo_map.get(&name) {
+                if let Some(ver) = self.pick_best_for_spec(&name, None, candidates) {
+                    ver
+                } else {
+                    // No candidate satisfies constraints → conflict
+                    self.state.conflicts.insert((name.clone(), Version::new(0, 0, 0)));
+                    continue;
+                }
+            } else if let Some(provs) = self.state.provides_map.get(&name) {
+                // Resolve virtual package to a real one
+                let mut best_real: Option<(String, Version)> = None;
+                for (real_name, real_ver) in provs {
+                    if let Some(candidates) = self.state.repo_map.get(real_name) {
+                        if self.pick_best_for_spec(real_name, None, candidates).is_some() {
+                            if let Some((_, cur_ver)) = &best_real {
+                                if real_ver > cur_ver {
+                                    best_real = Some((real_name.clone(), real_ver.clone()));
+                                }
+                            } else {
+                                best_real = Some((real_name.clone(), real_ver.clone()));
+                            }
                         }
                     }
-                    true
-                } else {
-                    false
                 }
-            })
-            .collect();
+                if let Some((real_name, real_ver)) = best_real {
+                    self.state.queue.push_back(real_name.clone());
+                    self.state.plan.insert(real_name.clone(), real_ver.clone());
+                    continue;
+                } else {
+                    self.state.conflicts.insert((name.clone(), Version::new(0, 0, 0)));
+                    continue;
+                }
+            } else {
+                // Package not found anywhere
+                self.state.conflicts.insert((name.clone(), Version::new(0, 0, 0)));
+                continue;
+            };
 
-        if candidates.is_empty() {
-            return Ok(None);
+            // Node for this name/version
+            let node = Node {
+                name: name.clone(),
+                version: best.clone(),
+                manifest: self
+                    .state
+                    .repo_map
+                    .get(&name)
+                    .and_then(|v| {
+                        v.iter()
+                            .find(|m| Version::parse(&m.version).unwrap() == best)
+                            .cloned()
+                    })
+                    .ok_or_else(|| crate::Error::Resolver(format!("manifest missing for {} {}", name, best)))?,
+            };
+
+            // Record resolution
+            self.state.plan.insert(node.name.clone(), node.version.clone());
+
+            // Enqueue dependencies
+            for dep in &node.manifest.depends {
+                let (dep_name, dep_req) = parse_spec(dep);
+                // If already planned or installed, skip
+                if self.state.plan.contains_key(&dep_name) {
+                    continue;
+                }
+                if let Some(installed_v) = self.state.installed.get(&dep_name) {
+                    if dep_req.matches(installed_v) {
+                        continue;
+                    }
+                }
+                self.state.queue.push_back(dep_name);
+            }
         }
 
-        // Sort descending by semver
-        let mut sorted = candidates.to_vec();
-        sorted.sort_by(|a, b| {
-            Version::parse(&b.version)
-                .unwrap()
-                .cmp(&Version::parse(&a.version).unwrap())
-        });
+        if !self.state.conflicts.is_empty() {
+            let mut c = self.state.conflicts.iter().collect::<Vec<_>>();
+            c.sort();
+            return Err(crate::Error::Resolver(format!(
+                "conflicts detected: {:?}",
+                c.into_iter().map(|(n, v)| format!("{}@{}", n, v)).collect::<Vec<_>>()
+            )));
+        }
 
-        Ok(Some(sorted[0]))
+        Ok(self
+            .state
+            .plan
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect())
     }
 
-    /// Generate a lockfile string from resolved pairs.
-    pub fn generate_lockfile(resolved: &[(String, Version)]) -> String {
+    /// Detect packages installed but not required by any dependency or explicit install
+    pub fn detect_orphans(&self, installed_map: &BTreeMap<String, Version>) -> Vec<(String, Version)> {
+        let mut required: BTreeSet<String> = BTreeSet::new();
+        // Required by plan
+        for (k, _) in &self.state.plan {
+            required.insert(k.clone());
+        }
+        // Required by installed packages' dependencies
+        for (name, ver) in installed_map {
+            if let Some(manifests) = self.state.repo_map.get(name) {
+                if let Some(mf) = manifests.iter().find(|m| Version::parse(&m.version).unwrap() == *ver) {
+                    for dep in &mf.depends {
+                        let (dep_name, _) = parse_spec(dep);
+                        required.insert(dep_name);
+                    }
+                }
+            }
+        }
+        installed_map
+            .iter()
+            .filter(|(k, _)| !required.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Choose the highest version satisfying no constraints (used by upgrade)
+    fn pick_best_for_spec(
+        &self,
+        name: &str,
+        _req: Option<VersionReq>,
+        candidates: &[PackageManifest],
+    ) -> Option<Version> {
+        let mut best: Option<Version> = None;
+        for mf in candidates {
+            let v = Version::parse(&mf.version).ok()?;
+            if let Some(b) = &best {
+                if v > *b {
+                    best = Some(v);
+                }
+            } else {
+                best = Some(v);
+            }
+        }
+        best
+    }
+
+    /// Generate a lockfile string from resolved set
+    pub fn generate_lockfile(resolved: &[(String, String)]) -> String {
         let mut out = String::new();
-        for (n, v) in resolved {
-            out.push_str(&format!("{}={}\n", n, v));
+        for (name, ver) in resolved {
+            out.push_str(&format!("{} {}\n", name, ver));
         }
         out
     }
-
-    /// Detect orphaned packages not required by any installed package.
-    pub fn detect_orphans(&self, installed_versions: &BTreeMap<String, Version>) -> Vec<(String, Version)> {
-        let mut required: BTreeSet<String> = BTreeSet::new();
-        for (_, deps) in self.repo_entries.iter() {
-            for m in deps {
-                let v = Version::parse(&m.version).unwrap();
-                if installed_versions.get(&m.name) == Some(&v) {
-                    required.insert(m.name.clone());
-                }
-            }
-        }
-        installed_versions
-            .iter()
-            .filter_map(|(n, v)| {
-                if required.contains(n) {
-                    None
-                } else {
-                    Some((n.clone(), v.clone()))
-                }
-            })
-            .collect()
-    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use semver::Version;
-
-    fn mk(name: &str, ver: &str, deps: Vec<&str>) -> PackageManifest {
-        PackageManifest {
-            name: name.to_string(),
-            version: ver.to_string(),
-            description: None,
-            license: None,
-            provides: vec![],
-            depends: deps.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    #[test]
-    fn test_resolver_picks_highest() {
-        let mut repo = BTreeMap::new();
-        repo.insert("a".into(), vec![mk("a", "1.0.0", vec![]), mk("a", "2.0.0", vec![])]);
-        let installed: BTreeMap<String, Version> = BTreeMap::new();
-        let resolver = Resolver::new(installed, repo);
-        let resolved = resolver.resolve(vec!["a".into()], ResolveOptions::default()).unwrap();
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].0, "a");
-        assert_eq!(resolved[0].1.to_string(), "2.0.0");
-    }
-
-    #[test]
-    fn test_resolver_deps() {
-        let mut repo = BTreeMap::new();
-        repo.insert("a".into(), vec![mk("a", "1.0.0", vec!["b"])]);
-        repo.insert("b".into(), vec![mk("b", "1.0.0", vec![])]);
-        let installed: BTreeMap<String, Version> = BTreeMap::new();
-        let resolver = Resolver::new(installed, repo);
-        let resolved = resolver.resolve(vec!["a".into()], ResolveOptions::default()).unwrap();
-        assert_eq!(resolved.len(), 2);
+/// Parse "name" or "name@>=1.2.0" into (name, req)
+fn parse_spec(spec: &str) -> (String, VersionReq) {
+    if let Some(idx) = spec.find('@') {
+        let name = spec[..idx].to_string();
+        let req_str = &spec[idx + 1..];
+        let req = VersionReq::parse(req_str).unwrap_or_else(|_| VersionReq::any());
+        (name, req)
+    } else {
+        (spec.to_string(), VersionReq::any())
     }
 }

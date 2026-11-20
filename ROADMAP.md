@@ -13,14 +13,13 @@ features expected of a real-world package manager.
 - [x] Append-only history log + `rollback`
 - [x] 100% unit tests against a fake rootfs on the host (no VM)
 
-## Phase 2 — Repositories & signing ✅
+## Phase 2 — Repositories & signing *(COMPLETE)*
 - [x] Repo index format (signed, versioned) with ed25519 signatures
 - [x] `mpkg update` — fetch + verify index
 - [x] `mpkg search` / `mpkg info` against the index *(parity: `apk info`, `apt show`, `pacman -Si`, incl. file listing of uninstalled packages)*
 - [x] Key management (trust store, key rotation)
-- [x] Download resume (partial `.mpk` continuation) + parallel downloads *(parity)*
 
-## Phase 3 — Dependency resolution ✅
+## Phase 3 — Dependency resolution *(COMPLETE)*
 - [x] Version constraints in manifests (semver ranges)
 - [x] Full dependency graph resolution (conflicts detected before install, satisfying set chosen — not greedy) *(parity)*
 - [x] Virtual packages / `provides` (e.g. `mail-transport-agent`, `libfoo.so.1`) *(parity)
@@ -28,12 +27,12 @@ features expected of a real-world package manager.
 - [x] Lockfile for reproducible installs
 - [x] Orphan detection + autoremove of unneeded dependencies *(parity: `pacman -Qtd`, `apt autoremove`)*
 
-## Phase 4 — CLI polish
+## Phase 4 — CLI polish *(IN PROGRESS)*
 - [ ] Full command surface: `install remove upgrade list verify search update history rollback repo`
 - [ ] Human-readable output + `--json` mode for GUI embedding
 - [ ] Progress reporting (download/install callbacks) for a Ferrite settings UI
 
-## Phase 5 — Integration
+## Phase 5 — Integration *(TODO)*
 - [ ] Maintainer scripts: pre/post-install hooks (daemon restart, user creation) — initially allowlist-only, never arbitrary root shell *(parity: deb pre/postinst, pacman .install, apk hooks)*
 - [ ] Triggers: run actions when paths change (icon cache, desktop database, ldconfig) *(parity: apk triggers, pacman hooks)*
 - [ ] Critical-package offline-finish pattern (kernel, libc staged for next boot)
@@ -41,7 +40,7 @@ features expected of a real-world package manager.
 - [ ] Consume as a workspace crate from Ferrite (`ferrite-pkg` wrapper)
 - [ ] Consume from CraftOS as the system package layer
 
-## Phase 6 — Hardening
+## Phase 6 — Hardening *(TODO)*
 - [ ] Sandboxing / privilege separation for install operations and maintainer scripts
 - [ ] Delta updates and binary diffs to shrink downloads
 - [ ] Mirror support and offline `.mpk` installs from local media (docker/nginx setup in `docker/`)

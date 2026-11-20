@@ -1,5 +1,5 @@
 mod index;
-pub use index::{PackageEntry, RepoIndex, RepoUpdateRequest, RepositoryClient};
+pub use index::{load_trusted_keys, PackageEntry, RepoIndex, RepoUpdateRequest, RepositoryClient};
 
 use std::path::PathBuf;
 
@@ -18,7 +18,10 @@ impl RepositoryClient {
     }
 
     /// Fetch the latest index from the repository, verify it, and write it locally.
-    pub async fn update(&self, trusted_keys: &[ed25519_dalek::VerifyingKey]) -> Result<RepoIndex, String> {
+pub async fn update(
+        &self,
+        trusted_keys: &[ed25519_dalek::VerifyingKey],
+    ) -> Result<RepoIndex, String> {
         let remote_index_url = format!("{}/index.json", self.base_url);
         let bytes = reqwest::get(&remote_index_url)
             .await

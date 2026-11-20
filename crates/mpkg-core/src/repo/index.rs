@@ -1,6 +1,5 @@
 // Repository index format and operations
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -8,7 +7,7 @@ pub struct RepoIndex {
     /// Schema version for forward/backward compatibility
     pub version: u32,
     /// Packages keyed by name
-    pub packages: BTreeMap<String, PackageEntry>,
+    pub packages: std::collections::BTreeMap<String, PackageEntry>,
     /// Ed25519 signature over the JSON bytes (base64)
     pub signature: String,
     /// Public key fingerprint (hex) that produced the signature
@@ -34,33 +33,44 @@ pub struct RepoUpdateRequest {
 impl RepoIndex {
     /// Load an index from a JSON file at `path` and verify its signature using `trusted_keys`.
     /// Returns an error if the file is missing, malformed, or the signature is invalid.
-    pub async fn load_and_verify<P: AsRef<Path>>(
+pub async fn load_and_verify<P: AsRef<Path>>(
         path: P,
         trusted_keys: &[ed25519_dalek::VerifyingKey],
     ) -> Result<Self, String> {
-        let bytes = tokio::fs::read(&path).await.map_err(|e| format!("read index: {e}"))?;
-        let candidate: Self = serde_json::from_slice(&bytes).map_err(|e| format!("parse index: {e}"))?;
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| format!("read index: {e}"))?;
+        let candidate: Self = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("parse index: {e}"))?;
 
         // Verify signature
-        let sig_bytes = base64::decode(&candidate.signature).map_err(|e| format!("decode signature: {e}"))?;
+        let sig_bytes = base64::decode(&candidate.signature)
+            .map_err(|e| format!("decode signature: {e}"))?;
         let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
-        let key_fp = hex::decode(&candidate.key_fingerprint).map_err(|e| format!("decode fingerprint: {e}"))?;
-        let key = ed25519_dalek::VerifyingKey::from_bytes(&key_fp.try_into().map_err(|_| "bad key length")?)
-            .map_err(|e| format!("bad key: {e}"))?;
+        let key_fp = hex::decode(&candidate.key_fingerprint)
+            .map_err(|e| format!("decode fingerprint: {e}"))?;
+        let key = ed25519_dalek::VerifyingKey::from_bytes(
+            &key_fp
+                .try_into()
+                .map_err(|_| "bad key length".to_string())?,
+        )
+        .map_err(|e| format!("bad key: {e}"))?;
 
-        key.verify(&bytes, &sig).map_err(|_| "signature verification failed".to_string())?
+        key.verify(&bytes, &sig)
+            .map_err(|_| "signature verification failed".to_string())?
             .then_some(candidate)
             .ok_or_else(|| "signature invalid".to_string())
     }
 
     /// Save the index to `path` and sign it using `signing_key`.
-    pub async fn save_and_sign<P: AsRef<Path>>(
+pub async fn save_and_sign<P: AsRef<Path>>(
         &self,
         path: P,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(), String> {
-        let json = serde_json::to_vec_pretty(self).map_err(|e| format!("serialize index: {e}"))?;
+        let json = serde_json::to_vec_pretty(self)
+            .map_err(|e| format!("serialize index: {e}"))?;
         let sig = signing_key.sign(&json);
         let mut out = self.clone();
         out.signature = base64::encode(sig.to_bytes());
@@ -70,6 +80,44 @@ impl RepoIndex {
             .await
             .map_err(|e| format!("write index: {e}"))
     }
+}
+
+/// Load trusted ed25519 public keys from directory of .pub files (hex contents)
+pub async fn load_trusted_keys(dir: &std::path::Path) -> Result<Vec<ed25519_dalek::VerifyingKey>, String> {
+    use std::fs::read_to_string;
+
+    let mut keys = Vec::new();
+    if !dir.exists() {
+        return Ok(keys);
+    }
+
+    for entry in walkdir::WalkDir::new(dir)
+        .max_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let hex_fp = match entry.file_name().to_str() {
+            Some(s) if s.ends_with(".pub") => &s[..s.len() - 4],
+            _ => continue,
+        };
+        let content = read_to_string(entry.path())
+            .map_err(|e| format!("read key {}: {e}", entry.path().display()))?;
+        let bytes = hex::decode(content.trim())
+            .map_err(|e| format!("decode key {}: {e}", entry.path().display()))?;
+        let key = ed25519_dalek::VerifyingKey::from_bytes(
+            &bytes
+                .try_into()
+                .map_err(|_| "bad key length".to_string())?,
+        )
+        .map_err(|e| format!("bad key {}: {e}", entry.path().display()))?;
+        keys.push(key);
+    }
+
+    Ok(keys)
 }
 
 #[cfg(test)]
@@ -91,25 +139,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_repo_index_sign_verify() {
+async fn test_repo_index_sign_verify() {
         let tmp = temp_dir();
         let (sk, vk) = keys();
 
         let mut idx = RepoIndex {
             version: 1,
-            packages: BTreeMap::new(),
+            packages: std::collections::BTreeMap::new(),
             signature: String::new(),
             key_fingerprint: String::new(),
         };
-        idx.packages.insert("foo".into(), PackageEntry {
-            name: "foo".into(),
-            version: "1.0.0".into(),
-            archive: "foo-1.0.0.mpk".into(),
-            manifest: "name=\"foo\"\nversion=\"1.0.0\"\n".into(),
-            size: 123,
-            sha256: "deadbeef".into(),
-            deps: vec![],
-        });
+        idx.packages.insert(
+            "foo".into(),
+            PackageEntry {
+                name: "foo".into(),
+                version: "1.0.0".into(),
+                archive: "foo-1.0.0.mpk".into(),
+                manifest: "name=\"foo\"\nversion=\"1.0.0\"\n".into(),
+                size: 123,
+                sha256: "deadbeef".into(),
+                deps: vec![],
+            },
+        );
 
         let idx_path = tmp.join("index.json");
         idx.save_and_sign(&idx_path, &sk).await.unwrap();
