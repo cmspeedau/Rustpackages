@@ -1,0 +1,26 @@
+# Docker Compose setup for running an mpkg package mirror.
+#
+# The mirror is just a static web server serving:
+#   - index.toml          (repo index, see docs/PACKAGING.md)
+#   - pkgs/*.mpk          (the package archives)
+#
+# Usage:
+#   docker compose up -d
+#   # then from a client:
+#   mpkg update http://localhost:8080
+#   mpkg search http://localhost:8080 rust
+#   mpkg install http://localhost:8080/pkgs/hello-1.0.0.mpk
+
+services:
+  mirror:
+    build:
+      context: .
+      dockerfile: Dockerfile.mirror
+    image: rustpackages-mirror:latest
+    ports:
+      - "8080:80"
+    volumes:
+      # Mount your published repo directory (containing index.toml and pkgs/).
+      # Build it with the script in docs/PACKAGING.md, e.g. ./publish/.
+      - ./publish:/usr/share/nginx/html:ro
+    restart: unless-stopped

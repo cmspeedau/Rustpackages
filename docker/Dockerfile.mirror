@@ -1,0 +1,9 @@
+# Minimal static mirror image for Rustpackages (.mpk + index.toml).
+# Serves the mounted repo directory over HTTP with nginx.
+
+FROM nginx:1.27-alpine
+
+# Sensible defaults for a read-only package mirror.
+COPY docker/nginx.mirror.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
