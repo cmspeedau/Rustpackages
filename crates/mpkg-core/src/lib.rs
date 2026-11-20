@@ -1,7 +1,13 @@
 //! Rootfs-agnostic core of the mpkg package manager.
 //!
-//! All operations take a target `root: &Path` so the core can run against
-//! any rootfs — including a fake rootfs in host-side unit tests.
+//! Every operation takes a target root path, so the whole crate is testable
+//! against a fake rootfs on the host — no VM required.
 
-/// Placeholder for the public API.
-pub fn placeholder() {}
+pub mod archive;
+pub mod manifest;
+pub mod repo;
+pub mod resolve;
+pub mod sign;
+pub mod store;
+
+pub use manifest::PkgManifest;
