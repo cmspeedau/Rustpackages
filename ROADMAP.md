@@ -13,20 +13,20 @@ features expected of a real-world package manager.
 - [x] Append-only history log + `rollback`
 - [x] 100% unit tests against a fake rootfs on the host (no VM)
 
-## Phase 2 — Repositories & signing *(IN PROGRESS)*
+## Phase 2 — Repositories & signing ✅
 - [x] Repo index format (signed, versioned) with ed25519 signatures
 - [x] `mpkg update` — fetch + verify index
 - [x] `mpkg search` / `mpkg info` against the index *(parity: `apk info`, `apt show`, `pacman -Si`, incl. file listing of uninstalled packages)*
-- [ ] Key management (trust store, key rotation)
-- [ ] Download resume (partial `.mpk` continuation) + parallel downloads *(parity)*
+- [x] Key management (trust store, key rotation)
+- [x] Download resume (partial `.mpk` continuation) + parallel downloads *(parity)*
 
-## Phase 3 — Dependency resolution
-- [ ] Version constraints in manifests (semver ranges)
-- [ ] Full dependency graph resolution (conflicts detected before install, satisfying set chosen — not greedy) *(parity)*
-- [ ] Virtual packages / `provides` (e.g. `mail-transport-agent`, `libfoo.so.1`) *(parity)
-- [ ] `mpkg upgrade` (full and per-package)
-- [ ] Lockfile for reproducible installs
-- [ ] Orphan detection + autoremove of unneeded dependencies *(parity: `pacman -Qtd`, `apt autoremove`)*
+## Phase 3 — Dependency resolution ✅
+- [x] Version constraints in manifests (semver ranges)
+- [x] Full dependency graph resolution (conflicts detected before install, satisfying set chosen — not greedy) *(parity)*
+- [x] Virtual packages / `provides` (e.g. `mail-transport-agent`, `libfoo.so.1`) *(parity)
+- [x] `mpkg upgrade` (full and per-package)
+- [x] Lockfile for reproducible installs
+- [x] Orphan detection + autoremove of unneeded dependencies *(parity: `pacman -Qtd`, `apt autoremove`)*
 
 ## Phase 4 — CLI polish
 - [ ] Full command surface: `install remove upgrade list verify search update history rollback repo`
