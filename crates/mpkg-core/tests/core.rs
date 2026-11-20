@@ -1,10 +1,10 @@
 use tempfile::TempDir;
 
-use crate::archive;
-use crate::store::Store;
+use mpkg_core::archive;
+use mpkg_core::store::{HistoryEntry, Store};
 
 fn make_pkg_src(dir: &std::path::Path, name: &str, version: &str, file_body: &str) {
-    std::fs::create_dir_all(dir.join("usr/share").as_path()).unwrap();
+    std::fs::create_dir_all(dir.join("usr/share")).unwrap();
     std::fs::write(
         dir.join("pkg.toml"),
         format!(
@@ -45,15 +45,20 @@ fn install_list_verify_remove_rollback() {
     assert!(!root.join("usr/share/hello.txt").exists());
     assert_eq!(store.history().unwrap().len(), 2); // install + remove
 
-    // Rollback undoes the remove (restores files from backup).
+    // Rollback undoes the remove and restores file contents from the trash.
     let e = store.rollback().unwrap();
-    assert_eq!(e.op, "remove");
+    assert!(matches!(e, HistoryEntry::Remove { .. }));
     assert!(root.join("usr/share/hello.txt").is_file());
+    assert_eq!(
+        std::fs::read_to_string(root.join("usr/share/hello.txt")).unwrap(),
+        "tampered" // trash preserved the tampered content; hashes still recorded
+    );
+    assert!(store.verify("hello").unwrap().is_empty());
 }
 
 #[test]
 fn manifest_validation_rejects_bad_names() {
-    let m: crate::manifest::PkgManifest = toml::from_str(
+    let m: mpkg_core::manifest::PkgManifest = toml::from_str(
         "[package]\nname = \"Bad Name!\"\nversion = \"1.0.0\"\n",
     )
     .unwrap();
@@ -62,9 +67,9 @@ fn manifest_validation_rejects_bad_names() {
 
 #[test]
 fn resolver_orders_dependencies_first_and_detects_cycles() {
-    use crate::repo::{RepoEntry, RepoIndex};
-    use crate::resolve::resolve;
-    use crate::manifest::Dependency;
+    use mpkg_core::manifest::Dependency;
+    use mpkg_core::repo::{RepoEntry, RepoIndex};
+    use mpkg_core::resolve::resolve;
 
     let mk = |name: &str, deps: Vec<Dependency>| RepoEntry {
         name: name.into(),
@@ -99,8 +104,8 @@ fn resolver_orders_dependencies_first_and_detects_cycles() {
 
 #[test]
 fn sign_and_verify_roundtrip() {
-    let (sk, pk) = crate::sign::generate_keypair();
-    let sig = crate::sign::sign(&sk, b"index data").unwrap();
-    assert!(crate::sign::verify(&pk, b"index data", &sig).unwrap());
-    assert!(!crate::sign::verify(&pk, b"other data", &sig).unwrap());
+    let (sk, pk) = mpkg_core::sign::generate_keypair();
+    let sig = mpkg_core::sign::sign(&sk, b"index data").unwrap();
+    assert!(mpkg_core::sign::verify(&pk, b"index data", &sig).unwrap());
+    assert!(!mpkg_core::sign::verify(&pk, b"other data", &sig).unwrap());
 }
