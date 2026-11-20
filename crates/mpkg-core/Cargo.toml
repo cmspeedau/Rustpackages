@@ -5,22 +5,23 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/cmspeedau/Rustpackages"
 
+[features]
+http = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-tokio = { version = "1", features = ["full"] }
 walkdir = "2"
-flate2 = "1"
 tar = "0.4"
+zstd = "0.13"
 sha2 = "0.10"
 ed25519-dalek = "2"
 hex = "0.4"
 base64 = "0.21"
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
-rand_core = "0.6"
+rand = "0.8"
 semver = { version = "1", features = ["serde"] }
-indexmap = "2"
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

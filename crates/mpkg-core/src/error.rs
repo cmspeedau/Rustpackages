@@ -22,6 +22,8 @@ pub enum MpkgError {
     VerifyFailed(usize),
     #[error("network error: {0}")]
     Network(String),
+    #[error("resolver error: {0}")]
+    Resolver(String),
     #[error("checksum mismatch: expected {expected}, got {actual}")]
     Checksum { expected: String, actual: String },
 }

@@ -20,7 +20,7 @@ fn load_repo_from_disk() {
         ],
     };
 
-    let mut repo = Repository {
+    let repo = Repository {
         name: String::new(),
         index: idx,
     };

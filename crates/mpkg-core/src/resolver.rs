@@ -6,7 +6,6 @@
 // - Detects orphaned packages
 
 use crate::{PackageManifest, Result};
-use indexmap::IndexMap;
 use semver::{Version, VersionReq};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -28,6 +27,7 @@ struct ResolverState {
     installed: BTreeMap<String, Version>,             // name -> installed version
     plan: BTreeMap<String, Version>,                   // name -> resolved version
     provides_map: BTreeMap<String, Vec<(String, Version)>>, // virtual -> real
+    reqs: BTreeMap<String, VersionReq>,                // name -> requested range
     queue: VecDeque<String>,                           // install queue
     conflicts: BTreeSet<(String, Version)>,            // explicit conflicts
 }
@@ -60,6 +60,7 @@ impl Resolver {
                 installed,
                 plan: BTreeMap::new(),
                 provides_map,
+                reqs: BTreeMap::new(),
                 queue: VecDeque::new(),
                 conflicts: BTreeSet::new(),
             },
@@ -75,9 +76,8 @@ impl Resolver {
     ) -> Result<Vec<(String, String)>> {
         // Seed queue
         if opts.upgrade_all {
-            for (name, ver) in &self.state.installed {
+            for name in self.state.installed.keys() {
                 self.state.queue.push_back(name.clone());
-                self.state.plan.insert(name.clone(), ver.clone());
             }
         } else {
             for spec in specs {
@@ -90,6 +90,7 @@ impl Resolver {
                         continue;
                     }
                 }
+                self.state.reqs.insert(name.clone(), req);
                 self.state.queue.push_back(name.clone());
             }
         }
@@ -102,8 +103,9 @@ impl Resolver {
             }
 
             // Find the best version in repo for this name
+            let req = self.state.reqs.get(&name).cloned();
             let best = if let Some(candidates) = self.state.repo_map.get(&name) {
-                if let Some(ver) = self.pick_best_for_spec(&name, None, candidates) {
+                if let Some(ver) = self.pick_best_for_spec(&name, req.as_ref(), candidates) {
                     ver
                 } else {
                     // No candidate satisfies constraints → conflict
@@ -115,7 +117,7 @@ impl Resolver {
                 let mut best_real: Option<(String, Version)> = None;
                 for (real_name, real_ver) in provs {
                     if let Some(candidates) = self.state.repo_map.get(real_name) {
-                        if self.pick_best_for_spec(real_name, None, candidates).is_some() {
+                        if self.pick_best_for_spec(real_name, req.as_ref(), candidates).is_some() {
                             if let Some((_, cur_ver)) = &best_real {
                                 if real_ver > cur_ver {
                                     best_real = Some((real_name.clone(), real_ver.clone()));
@@ -153,7 +155,7 @@ impl Resolver {
                             .find(|m| Version::parse(&m.version).unwrap() == best)
                             .cloned()
                     })
-                    .ok_or_else(|| crate::Error::Resolver(format!("manifest missing for {} {}", name, best)))?,
+                    .ok_or_else(|| crate::MpkgError::Resolver(format!("manifest missing for {} {}", name, best)))?,
             };
 
             // Record resolution
@@ -171,6 +173,7 @@ impl Resolver {
                         continue;
                     }
                 }
+                self.state.reqs.insert(dep_name.clone(), dep_req);
                 self.state.queue.push_back(dep_name);
             }
         }
@@ -178,7 +181,7 @@ impl Resolver {
         if !self.state.conflicts.is_empty() {
             let mut c = self.state.conflicts.iter().collect::<Vec<_>>();
             c.sort();
-            return Err(crate::Error::Resolver(format!(
+            return Err(crate::MpkgError::Resolver(format!(
                 "conflicts detected: {:?}",
                 c.into_iter().map(|(n, v)| format!("{}@{}", n, v)).collect::<Vec<_>>()
             )));
@@ -220,18 +223,21 @@ impl Resolver {
     /// Choose the highest version satisfying no constraints (used by upgrade)
     fn pick_best_for_spec(
         &self,
-        name: &str,
-        _req: Option<VersionReq>,
+        _name: &str,
+        req: Option<&VersionReq>,
         candidates: &[PackageManifest],
     ) -> Option<Version> {
         let mut best: Option<Version> = None;
         for mf in candidates {
-            let v = Version::parse(&mf.version).ok()?;
-            if let Some(b) = &best {
-                if v > *b {
-                    best = Some(v);
+            let Ok(v) = Version::parse(&mf.version) else {
+                continue;
+            };
+            if let Some(r) = req {
+                if !r.matches(&v) {
+                    continue;
                 }
-            } else {
+            }
+            if best.as_ref().map_or(true, |b| v > *b) {
                 best = Some(v);
             }
         }
@@ -248,14 +254,17 @@ impl Resolver {
     }
 }
 
-/// Parse "name" or "name@>=1.2.0" into (name, req)
+/// Parse "name", "name@>=1.2.0", or "name>=1.2.0" into (name, req).
 fn parse_spec(spec: &str) -> (String, VersionReq) {
-    if let Some(idx) = spec.find('@') {
-        let name = spec[..idx].to_string();
-        let req_str = &spec[idx + 1..];
-        let req = VersionReq::parse(req_str).unwrap_or_else(|_| VersionReq::any());
-        (name, req)
-    } else {
-        (spec.to_string(), VersionReq::any())
+    if let Some((name, req_str)) = spec.split_once('@') {
+        let req = VersionReq::parse(req_str).unwrap_or(VersionReq::STAR);
+        return (name.to_string(), req);
     }
+    // Manifest dependencies commonly use `name>=1.2.3` with no `@`.
+    if let Some(idx) = spec.find(|c: char| "<>=~^".contains(c)) {
+        let name = spec[..idx].to_string();
+        let req = VersionReq::parse(&spec[idx..]).unwrap_or(VersionReq::STAR);
+        return (name, req);
+    }
+    (spec.to_string(), VersionReq::STAR)
 }

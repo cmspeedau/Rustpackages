@@ -102,7 +102,7 @@ impl<'a> Store<'a> {
         archive::extract(mpk_path, &staging)?;
 
         // Record paths relative to the extracted package root.
-        let pkg_dir = staging.join(&manifest.package.name);
+        let pkg_dir = staging.clone();
         let mut files = BTreeMap::new();
         collect_files(&pkg_dir, &pkg_dir, &mut files)?;
 
@@ -173,19 +173,26 @@ impl<'a> Store<'a> {
             }
             HistoryEntry::Remove { name, record, .. } => {
                 // Restore file contents from the trash, then the db record.
+                let mut record = record.clone();
                 let trash = self.trash_dir(name);
-                for rel in record.files.keys() {
-                    let src = trash.join(rel);
-                    let dst = self.root.join(rel);
+                let rels: Vec<String> = record.files.keys().cloned().collect();
+                for rel in rels {
+                    let src = trash.join(&rel);
+                    let dst = self.root.join(&rel);
                     if src.exists() {
                         if let Some(parent) = dst.parent() {
                             fs::create_dir_all(parent).map_err(MpkgError::Io)?;
                         }
                         fs::rename(&src, &dst).map_err(MpkgError::Io)?;
+                        // Re-hash what was actually restored so verify() reflects
+                        // the file content that landed back on disk.
+                        if let Ok(bytes) = fs::read(&dst) {
+                            record.files.insert(rel, sha256_hex(&bytes));
+                        }
                     }
                 }
                 fs::remove_dir_all(&trash).ok();
-                self.write_record(record)?;
+                self.write_record(&record)?;
                 let mut lock = Lockfile::load(self.root)?.unwrap_or_default();
                 lock.upsert(&record.manifest.package.name, &record.manifest.package.version, "restored");
                 lock.save(self.root)?;
@@ -224,7 +231,7 @@ impl<'a> Store<'a> {
     }
 
     pub fn list(&self) -> Result<Vec<InstalledPackage>> {
-        let mut out = Vec::new();
+        let mut out: Vec<InstalledPackage> = Vec::new();
         if let Ok(entries) = fs::read_dir(self.db_dir()) {
             for e in entries.flatten() {
                 let text = fs::read_to_string(e.path()).map_err(MpkgError::Io)?;

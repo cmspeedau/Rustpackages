@@ -49,6 +49,45 @@ pub fn build_package(src_dir: &Path, out_path: &Path) -> io::Result<PkgManifest>
     Ok(manifest)
 }
 
+/// Read the manifest from a `.mpk` archive without fully extracting it.
+pub fn read_manifest(pkg_path: &Path) -> std::io::Result<PkgManifest> {
+    use std::io::Read;
+    let file = std::fs::File::open(pkg_path)?;
+    let decoder = zstd::Decoder::new(std::io::BufReader::new(file))?;
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        if path == std::path::Path::new(MANIFEST_NAME) {
+            let mut s = String::new();
+            entry.read_to_string(&mut s)?;
+            let manifest: PkgManifest = toml::from_str(&s)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            manifest
+                .validate()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            return Ok(manifest);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("{} not found in archive", MANIFEST_NAME),
+    ))
+}
+
+/// Extract a `.mpk` archive into `dest`.
+pub fn extract(pkg_path: &Path, dest: &Path) -> std::io::Result<()> {
+    extract_package(pkg_path, dest)?;
+    Ok(())
+}
+
+/// SHA-256 hex digest of a file.
+pub fn archive_sha256(pkg_path: &Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    let bytes = std::fs::read(pkg_path)?;
+    Ok(hex::encode(sha2::Sha256::digest(bytes)))
+}
+
 /// Extract a `.mpk` archive into `dest` and return its parsed manifest.
 pub fn extract_package(pkg_path: &Path, dest: &Path) -> io::Result<PkgManifest> {
     let file = File::open(pkg_path)?;

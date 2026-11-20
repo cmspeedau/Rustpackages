@@ -1,10 +1,9 @@
 use clap::{Arg, Command};
 use colored::Colorize;
-use mpkg_core::{Error, PackageManifest, ResolveOptions, Resolver};
+use mpkg_core::{PackageManifest, ResolveOptions, Resolver};
 use semver::Version;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
 
 fn main() {
     let matches = Command::new("mpkg")
@@ -77,27 +76,35 @@ fn main() {
     let mut repo_map: BTreeMap<String, Vec<PackageManifest>> = BTreeMap::new();
 
     // Mock manifests (real builds load these from disk)
-    let mut zsh = PackageManifest {
+    let zsh = PackageManifest {
         name: "zsh".to_string(),
-        version: "5.9".to_string(),
+        version: "5.9.0".to_string(),
+        description: None,
+        license: None,
         depends: vec!["libiconv>=1.16".to_string()],
         provides: vec![],
     };
-    let mut libiconv = PackageManifest {
+    let libiconv = PackageManifest {
         name: "libiconv".to_string(),
-        version: "1.16".to_string(),
+        version: "1.16.0".to_string(),
+        description: None,
+        license: None,
         depends: vec![],
         provides: vec![],
     };
-    let mut git = PackageManifest {
+    let git = PackageManifest {
         name: "git".to_string(),
         version: "2.43.0".to_string(),
+        description: None,
+        license: None,
         depends: vec!["zlib>=1.2.13".to_string()],
         provides: vec![],
     };
-    let mut zlib = PackageManifest {
+    let zlib = PackageManifest {
         name: "zlib".to_string(),
         version: "1.2.13".to_string(),
+        description: None,
+        license: None,
         depends: vec![],
         provides: vec![],
     };
@@ -114,8 +121,8 @@ fn main() {
     repo_map.insert("zlib".into(), vec![zlib.clone()]);
 
     // Simulate installed state
-    installed.insert("zsh".into(), Version::parse("5.8").unwrap());
-    installed.insert("libiconv".into(), Version::parse("1.15").unwrap());
+    installed.insert("zsh".into(), Version::parse("5.8.0").unwrap());
+    installed.insert("libiconv".into(), Version::parse("1.15.0").unwrap());
     installed.insert("git".into(), Version::parse("2.42.0").unwrap());
 
     let json_mode = matches.get_flag("json");
@@ -226,7 +233,7 @@ fn execute_upgrade(
 }
 
 fn execute_remove(
-    installed: &BTreeMap<String, Version>,
+    _installed: &BTreeMap<String, Version>,
     _repo_map: &BTreeMap<String, Vec<PackageManifest>>,
     specs: &[String],
     json: bool,
