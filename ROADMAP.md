@@ -5,25 +5,25 @@ CraftOS can embed as a library. Ordered by dependency — each phase unblocks
 the next. Items marked *(parity)* come from the apk/deb/pacman comparison —
 features expected of a real-world package manager.
 
-## Phase 1 — Core foundations (library-usable, no network)
-- [ ] `mpkg-core`: manifest parsing (`pkg.toml` → typed struct, serde + toml)
-- [ ] `.mpk` archive read/write (tar + zstd, deterministic layout)
-- [ ] Install/remove on a target root (`root: &Path`), staged + atomic swap
-- [ ] File ownership database (which package owns which path) + conflict detection *(parity: deb/pacman error, apk overwrite)*
-- [ ] Append-only history log + `rollback`
-- [ ] 100% unit tests against a fake rootfs on the host (no VM)
+## Phase 1 — Core foundations (library-usable, no network) ✅
+- [x] `mpkg-core`: manifest parsing (`pkg.toml` → typed struct, serde + toml)
+- [x] `.mpk` archive read/write (tar + zstd, deterministic layout)
+- [x] Install/remove on a target root (`root: &Path`), staged + atomic swap
+- [x] File ownership database (which package owns which path) + conflict detection *(parity: deb/pacman error, apk overwrite)*
+- [x] Append-only history log + `rollback`
+- [x] 100% unit tests against a fake rootfs on the host (no VM)
 
-## Phase 2 — Repositories & signing
-- [ ] Repo index format (signed, versioned) with ed25519 signatures
-- [ ] `mpkg update` — fetch + verify index
-- [ ] `mpkg search` / `mpkg info` against the index *(parity: `apk info`, `apt show`, `pacman -Si`, incl. file listing of uninstalled packages)*
+## Phase 2 — Repositories & signing *(IN PROGRESS)*
+- [x] Repo index format (signed, versioned) with ed25519 signatures
+- [x] `mpkg update` — fetch + verify index
+- [x] `mpkg search` / `mpkg info` against the index *(parity: `apk info`, `apt show`, `pacman -Si`, incl. file listing of uninstalled packages)*
 - [ ] Key management (trust store, key rotation)
 - [ ] Download resume (partial `.mpk` continuation) + parallel downloads *(parity)*
 
 ## Phase 3 — Dependency resolution
 - [ ] Version constraints in manifests (semver ranges)
 - [ ] Full dependency graph resolution (conflicts detected before install, satisfying set chosen — not greedy) *(parity)*
-- [ ] Virtual packages / `provides` (e.g. `mail-transport-agent`, `libfoo.so.1`) *(parity)*
+- [ ] Virtual packages / `provides` (e.g. `mail-transport-agent`, `libfoo.so.1`) *(parity)
 - [ ] `mpkg upgrade` (full and per-package)
 - [ ] Lockfile for reproducible installs
 - [ ] Orphan detection + autoremove of unneeded dependencies *(parity: `pacman -Qtd`, `apt autoremove`)*
