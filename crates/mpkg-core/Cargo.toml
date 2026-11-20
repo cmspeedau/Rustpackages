@@ -8,6 +8,7 @@ description = "Rootfs-agnostic core of the mpkg package manager: manifests, .mpk
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 tar = "0.4"
 zstd = "0.13"
@@ -19,3 +20,6 @@ thiserror = "2"
 ed25519-dalek = "2"
 base64 = "0.22"
 rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
