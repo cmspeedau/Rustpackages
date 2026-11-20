@@ -1,0 +1,10 @@
+[package]
+name = "mpkg-cli"
+version = "0.1.0"
+description = "CLI for the mpkg package manager"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mpkg-core = { path = "../mpkg-core" }
