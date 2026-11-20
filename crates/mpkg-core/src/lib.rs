@@ -1,13 +1,13 @@
-//! Rootfs-agnostic core of the mpkg package manager.
-//!
-//! Every operation takes a target root path, so the whole crate is testable
-//! against a fake rootfs on the host — no VM required.
+//! mpkg-core: rootfs-agnostic core library for the Rustpackages package manager.
 
 pub mod archive;
+pub mod error;
+pub mod lockfile;
 pub mod manifest;
+pub mod remote;
 pub mod repo;
 pub mod resolve;
 pub mod sign;
 pub mod store;
 
-pub use manifest::PkgManifest;
+pub use error::{MpkgError, Result};
