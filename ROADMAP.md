@@ -1,9 +1,25 @@
-## mpkg Roadmap
+# mpkg Roadmap
 
-- [x] Phase 1: Basic package archive and repository signing
-- [x] Phase 2: Repository client and update workflow
-- [x] Phase 3: Dependency resolution with semver, virtual packages (`provides`), lockfile, upgrade and autoremove
-- [x] Phase 4: CLI polish (colors, --json, progress reporting, improved help)
-- [ ] Phase 5: Maintainer scripts (pre-install, post-install, triggers)
+## Phase 3: Dependency Resolution ✅
+- Semver constraints
+- Virtual packages (`provides`)
+- Upgrade workflows
+- Lockfile write
+- Orphan detection
 
-Next: Phase 5 (maintainer scripts, triggers) or embedding into Ferrite/CraftOS depending on priority.
+## Phase 4: CLI Polish ✅
+- Human-readable, colored output
+- `--json` mode for GUI embedding
+- Progress reporting (`on_download`, `on_install`)
+- Command parity (`install`, `upgrade`, `remove`, `autoremove`, `lock`, `list`)
+- `mpkg --version`, `mpkg --help`
+
+## Phase 5: Integration & Packaging 🚧
+- Embed into Ferrite/CraftOS
+- Maintainer scripts (`pre/post-install`)
+- Trigger hooks (file triggers, config changes)
+- Full test suite in CI
+- Publish to crates.io
+
+---
+*Last updated: 2026-11-21*
