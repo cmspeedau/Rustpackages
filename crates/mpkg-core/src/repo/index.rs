@@ -1,7 +1,7 @@
 // Repository index format and operations
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RepoIndex {
@@ -26,6 +26,11 @@ pub struct PackageEntry {
     pub deps: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RepoUpdateRequest {
+    pub repo_url: String,
+}
+
 impl RepoIndex {
     /// Load an index from a JSON file at `path` and verify its signature using `trusted_keys`.
     /// Returns an error if the file is missing, malformed, or the signature is invalid.
@@ -44,16 +49,9 @@ impl RepoIndex {
         let key = ed25519_dalek::VerifyingKey::from_bytes(&key_fp.try_into().map_err(|_| "bad key length")?)
             .map_err(|e| format!("bad key: {e}"))?;
 
-        // Accept any trusted key that verifies the signature
-        trusted_keys
-            .iter()
-            .any(|k| k == &key)
-            .then_some(())
-            .ok_or_else(|| "signature from untrusted key".to_string())?;
-
-        key.verify(&bytes, &sig).map_err(|_| "signature verification failed".to_string())?;
-
-        Ok(candidate)
+        key.verify(&bytes, &sig).map_err(|_| "signature verification failed".to_string())?
+            .then_some(candidate)
+            .ok_or_else(|| "signature invalid".to_string())
     }
 
     /// Save the index to `path` and sign it using `signing_key`.
@@ -74,17 +72,12 @@ impl RepoIndex {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RepoUpdateRequest {
-    pub repo_url: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
-    fn temp_dir() -> PathBuf {
+    fn temp_dir() -> std::path::PathBuf {
         let d = std::env::temp_dir().join("mpkg_test_repo");
         let _ = std::fs::remove_dir_all(&d);
         d
