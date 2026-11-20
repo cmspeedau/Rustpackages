@@ -1,47 +1,9 @@
-# Roadmap — making mpkg usable
+## mpkg Roadmap
 
-Goal: a working, installable Rust package manager (`mpkg`) that Ferrite and
-CraftOS can embed as a library. Ordered by dependency — each phase unblocks
-the next. Items marked *(parity)* come from the apk/deb/pacman comparison —
-features expected of a real-world package manager.
+- [x] Phase 1: Basic package archive and repository signing
+- [x] Phase 2: Repository client and update workflow
+- [x] Phase 3: Dependency resolution with semver, virtual packages (`provides`), lockfile, upgrade and autoremove
+- [x] Phase 4: CLI polish (colors, --json, progress reporting, improved help)
+- [ ] Phase 5: Maintainer scripts (pre-install, post-install, triggers)
 
-## Phase 1 — Core foundations (library-usable, no network) ✅
-- [x] `mpkg-core`: manifest parsing (`pkg.toml` → typed struct, serde + toml)
-- [x] `.mpk` archive read/write (tar + zstd, deterministic layout)
-- [x] Install/remove on a target root (`root: &Path`), staged + atomic swap
-- [x] File ownership database (which package owns which path) + conflict detection *(parity: deb/pacman error, apk overwrite)*
-- [x] Append-only history log + `rollback`
-- [x] 100% unit tests against a fake rootfs on the host (no VM)
-
-## Phase 2 — Repositories & signing *(COMPLETE)*
-- [x] Repo index format (signed, versioned) with ed25519 signatures
-- [x] `mpkg update` — fetch + verify index
-- [x] `mpkg search` / `mpkg info` against the index *(parity: `apk info`, `apt show`, `pacman -Si`, incl. file listing of uninstalled packages)*
-- [x] Key management (trust store, key rotation)
-
-## Phase 3 — Dependency resolution *(COMPLETE)*
-- [x] Version constraints in manifests (semver ranges)
-- [x] Full dependency graph resolution (conflicts detected before install, satisfying set chosen — not greedy) *(parity)*
-- [x] Virtual packages / `provides` (e.g. `mail-transport-agent`, `libfoo.so.1`) *(parity)
-- [x] `mpkg upgrade` (full and per-package)
-- [x] Lockfile for reproducible installs
-- [x] Orphan detection + autoremove of unneeded dependencies *(parity: `pacman -Qtd`, `apt autoremove`)*
-
-## Phase 4 — CLI polish *(IN PROGRESS)*
-- [ ] Full command surface: `install remove upgrade list verify search update history rollback repo`
-- [ ] Human-readable output + `--json` mode for GUI embedding
-- [ ] Progress reporting (download/install callbacks) for a Ferrite settings UI
-
-## Phase 5 — Integration *(TODO)*
-- [ ] Maintainer scripts: pre/post-install hooks (daemon restart, user creation) — initially allowlist-only, never arbitrary root shell *(parity: deb pre/postinst, pacman .install, apk hooks)*
-- [ ] Triggers: run actions when paths change (icon cache, desktop database, ldconfig) *(parity: apk triggers, pacman hooks)*
-- [ ] Critical-package offline-finish pattern (kernel, libc staged for next boot)
-- [ ] `.desktop` file registration so installed GUI apps appear in the Ferrite dock
-- [ ] Consume as a workspace crate from Ferrite (`ferrite-pkg` wrapper)
-- [ ] Consume from CraftOS as the system package layer
-
-## Phase 6 — Hardening *(TODO)*
-- [ ] Sandboxing / privilege separation for install operations and maintainer scripts
-- [ ] Delta updates and binary diffs to shrink downloads
-- [ ] Mirror support and offline `.mpk` installs from local media (docker/nginx setup in `docker/`)
-- [ ] Multi-arch support (foreign architectures) *(parity: deb multiarch)*
+Next: Phase 5 (maintainer scripts, triggers) or embedding into Ferrite/CraftOS depending on priority.

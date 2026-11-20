@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "mpkg")]
-#[command(about = "Rust-native package manager for Ferrite/CraftOS", long_about = None)]
+#[command(about = "Rust-native package manager for Ferrite/CraftOS", long_about = None, version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -13,6 +13,10 @@ struct Cli {
     /// Set repository root (default: /var/lib/mpkg)
     #[arg(long, global = true, default_value = "/var/lib/mpkg")]
     repo_root: PathBuf,
+
+    /// Output machine-readable JSON (for GUI embedding)
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -29,13 +33,13 @@ enum Commands {
     Upgrade { names: Vec<String> },
     /// Remove orphaned packages no longer required
     Autoremove,
-    /// Manage trusted repository keys
-    #[command(subcommand)]
-    Key(KeyCommands),
     /// Search repository for packages
     Search { query: Option<String> },
     /// Show detailed information about a package
     Info { name: String },
+    /// Manage trusted repository keys
+    #[command(subcommand)]
+    Key(KeyCommands),
 }
 
 #[derive(Subcommand)]
@@ -56,36 +60,67 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Install { names } => {
             if names.is_empty() {
-                eprintln!("No packages specified");
-                std::process::exit(1);
+                return Err(anyhow::anyhow!("No packages specified"));
             }
             let lock = mpkg_core::resolve_install(&backend, &names)
                 .await
                 .context("failed to resolve packages")?;
+
+            // Human output
+            if !cli.json {
+                println!("Resolved to install:");
+                for (n, v) in &lock.resolved {
+                    println!("  {} v{}", n, v);
+                }
+            } else {
+                #[derive(serde::Serialize)]
+                struct Out { resolved: Vec<(String, String)> }
+                println!("{}", serde_json::to_string(&Out { resolved: lock.resolved.clone() })?);
+            }
+
             mpkg_core::install_lock(&backend, &lock)
                 .await
                 .context("failed to install packages")?;
+
             mpkg_core::write_lockfile(&backend, &lock)
                 .await
                 .context("failed to write lockfile")?;
-            println!("Installed:");
-            for (n, v) in &lock.resolved {
-                println!("  {} v{}", n, v);
+
+            if !cli.json {
+                println!("\x1b[32mInstalled successfully:\x1b[0m");
+                for (n, v) in &lock.resolved {
+                    println!("  {} v{}", n, v);
+                }
             }
         }
         Commands::List => {
-            list_installed(&backend).await?;
+            list_installed(&backend, cli.json).await?;
         }
         Commands::Update => {
-            update_repo(&backend).await?;
+            update_repo(&backend, cli.json).await?;
         }
         Commands::Lock => {
             let lock = mpkg_core::resolve_upgrade(&backend).await
                 .context("failed to resolve upgrade set")?;
+
+            if !cli.json {
+                println!("Lockfile will contain:");
+                for (n, v) in &lock.resolved {
+                    println!("  {} v{}", n, v);
+                }
+            } else {
+                #[derive(serde::Serialize)]
+                struct Out { resolved: Vec<(String, String)> }
+                println!("{}", serde_json::to_string(&Out { resolved: lock.resolved.clone() })?);
+            }
+
             mpkg_core::write_lockfile(&backend, &lock)
                 .await
                 .context("failed to write lockfile")?;
-            println!("Lockfile written to {}", backend.lockfile_path().display());
+
+            if !cli.json {
+                println!("Lockfile written to {}", backend.lockfile_path().display());
+            }
         }
         Commands::Upgrade { names } => {
             let mut opts = ResolveOptions::default();
@@ -95,91 +130,137 @@ async fn main() -> anyhow::Result<()> {
             let lock = mpkg_core::resolve_install(&backend, &names)
                 .await
                 .context("failed to resolve upgrade")?;
+
             if lock.resolved.is_empty() {
-                println!("All packages are up to date.");
+                if !cli.json {
+                    println!("All packages are up to date.");
+                } else {
+                    #[derive(serde::Serialize)]
+                    struct Out { upgraded: Vec<(String, String)> }
+                    println!("{}", serde_json::to_string(&Out { upgraded: vec![] })?);
+                }
             } else {
                 mpkg_core::install_lock(&backend, &lock)
                     .await
                     .context("failed to install upgraded packages")?;
+
                 mpkg_core::write_lockfile(&backend, &lock)
                     .await
                     .context("failed to write lockfile")?;
-                println!("Upgraded:");
-                for (n, v) in &lock.resolved {
-                    println!("  {} v{}", n, v);
+
+                if !cli.json {
+                    println!("\x1b[33mUpgraded:\x1b[0m");
+                    for (n, v) in &lock.resolved {
+                        println!("  {} v{}", n, v);
+                    }
+                } else {
+                    #[derive(serde::Serialize)]
+                    struct Out { upgraded: Vec<(String, String)> }
+                    println!("{}", serde_json::to_string(&Out { upgraded: lock.resolved.clone() })?);
                 }
             }
         }
         Commands::Autoremove => {
             let orphans = mpkg_core::autoremove(&backend).await
                 .context("failed to detect orphans")?;
+
             if orphans.is_empty() {
-                println!("No orphaned packages.");
-            } else {
-                println!("Orphaned packages to remove:");
-                for (n, v) in &orphans {
-                    println!("  {} v{}", n, v);
+                if !cli.json {
+                    println!("No orphaned packages.");
+                } else {
+                    #[derive(serde::Serialize)]
+                    struct Out { orphans: Vec<(String, String)> }
+                    println!("{}", serde_json::to_string(&Out { orphans: vec![] })?);
                 }
-                // Stub: do not actually remove; user must confirm
+            } else {
+                if !cli.json {
+                    println!("\x1b[31mOrphaned packages to remove:\x1b[0m");
+                    for (n, v) in &orphans {
+                        println!("  {} v{}", n, v);
+                    }
+                    // Stub: do not actually remove; user must confirm
+                } else {
+                    #[derive(serde::Serialize)]
+                    struct Out { orphans: Vec<(String, String)> }
+                    println!("{}", serde_json::to_string(&Out { orphans })?);
+                }
             }
         }
         Commands::Key(cmd) => match cmd {
             KeyCommands::Add { key_file } => {
-                key_add(&backend, &key_file).await?;
+                key_add(&backend, &key_file, cli.json).await?;
             }
             KeyCommands::List => {
-                key_list(&backend).await?;
+                key_list(&backend, cli.json).await?;
             }
         },
         Commands::Search { query } => {
-            search_repo(&backend, query.as_deref()).await?;
+            search_repo(&backend, query.as_deref(), cli.json).await?;
         }
         Commands::Info { name } => {
-            info_repo(&backend, &name).await?;
+            info_repo(&backend, &name, cli.json).await?;
         }
     }
 
     Ok(())
 }
 
-async fn list_installed(backend: &FsBackend) -> anyhow::Result<()> {
+async fn list_installed(backend: &FsBackend, json: bool) -> anyhow::Result<()> {
     let list = mpkg_core::list_installed_packages(backend).await?;
     if list.is_empty() {
-        println!("No packages installed.");
+        if !json {
+            println!("No packages installed.");
+        } else {
+            #[derive(serde::Serialize)]
+            struct Out { installed: Vec<(String, String)> }
+            println!("{}", serde_json::to_string(&Out { installed: vec![] })?);
+        }
     } else {
-        println!("Installed packages:");
-        for (n, v) in list {
-            println!("  {} v{}", n, v);
+        if !json {
+            println!("Installed packages:");
+            for (n, v) in &list {
+                println!("  {} v{}", n, v);
+            }
+        } else {
+            #[derive(serde::Serialize)]
+            struct Out { installed: Vec<(String, String)> }
+            println!("{}", serde_json::to_string(&Out { installed: list.clone() })?);
         }
     }
     Ok(())
 }
 
-async fn update_repo(backend: &FsBackend) -> anyhow::Result<()> {
+async fn update_repo(backend: &FsBackend, json: bool) -> anyhow::Result<()> {
     let trusted_keys = mpkg_core::repo::load_trusted_keys(&backend.repos_dir().join("trusted-keys")).await?;
 
-    let base_url = std::env::var("MPKG_REPO_URL")
-        .unwrap_or_else(|_| "https://packages.rustos.dev/v1".to_string());
+    let base_url = std::env::var("MPKG_REPO_URL").unwrap_or_else(|_| "https://packages.rustos.dev/v1".to_string());
 
     let client = mpkg_core::RepositoryClient::new(base_url, backend.repos_dir());
     match client.update(&trusted_keys).await {
         Ok(idx) => {
-            println!(
-                "Repository index updated. {} packages available.",
-                idx.packages.len()
-            );
+            if !json {
+                println!("Repository index updated. {} packages available.", idx.packages.len());
+            } else {
+                #[derive(serde::Serialize)]
+                struct Out { packages: usize }
+                println!("{}", serde_json::to_string(&Out { packages: idx.packages.len() })?);
+            }
             Ok(())
         }
         Err(e) => {
-            eprintln!("Failed to update repository: {}", e);
+            if !json {
+                eprintln!("Failed to update repository: {}", e);
+            } else {
+                #[derive(serde::Serialize)]
+                struct ErrOut { error: String }
+                println!("{}", serde_json::to_string(&ErrOut { error: e.to_string() })?);
+            }
             std::process::exit(1);
         }
     }
 }
 
-// (helper fns key_add, key_list, search_repo, info_repo remain unchanged from previous version)
-
-async fn key_add(backend: &FsBackend, key_file: &std::path::Path) -> anyhow::Result<()> {
+async fn key_add(backend: &FsBackend, key_file: &std::path::Path, json: bool) -> anyhow::Result<()> {
     use std::fs::{create_dir_all, read_to_string};
 
     let dest_dir = backend.repos_dir().join("trusted-keys");
@@ -192,15 +273,28 @@ async fn key_add(backend: &FsBackend, key_file: &std::path::Path) -> anyhow::Res
     let fp = hex::encode(bytes);
     let out_path = dest_dir.join(format!("{}.pub", fp));
 
-    tokio::fs::write(&out_path, content).await?;
-    println!("Added trusted key: {}", out_path.display());
+    tokio::fs::write(&out_path, &content).await?;
+
+    if !json {
+        println!("Added trusted key: {}", out_path.display());
+    } else {
+        #[derive(serde::Serialize)]
+        struct Out { key_file: String }
+        println!("{}", serde_json::to_string(&Out { key_file: out_path.display().to_string() })?);
+    }
     Ok(())
 }
 
-async fn key_list(backend: &FsBackend) -> anyhow::Result<()> {
+async fn key_list(backend: &FsBackend, json: bool) -> anyhow::Result<()> {
     let dir = backend.repos_dir().join("trusted-keys");
     if !dir.exists() {
-        println!("No trusted keys.");
+        if !json {
+            println!("No trusted keys.");
+        } else {
+            #[derive(serde::Serialize)]
+            struct Out { keys: Vec<String> }
+            println!("{}", serde_json::to_string(&Out { keys: vec![] })?);
+        }
         return Ok(());
     }
     let mut keys = Vec::new();
@@ -216,21 +310,33 @@ async fn key_list(backend: &FsBackend) -> anyhow::Result<()> {
             }
         }
     }
-    if keys.is_empty() {
-        println!("No trusted keys.");
-    } else {
-        println!("Trusted keys:");
-        for k in keys {
-            println!("  {}", k);
+    if !json {
+        if keys.is_empty() {
+            println!("No trusted keys.");
+        } else {
+            println!("Trusted keys:");
+            for k in &keys {
+                println!("  {}", k);
+            }
         }
+    } else {
+        #[derive(serde::Serialize)]
+        struct Out { keys: Vec<String> }
+        println!("{}", serde_json::to_string(&Out { keys })?);
     }
     Ok(())
 }
 
-async fn search_repo(backend: &FsBackend, query: Option<&str>) -> anyhow::Result<()> {
+async fn search_repo(backend: &FsBackend, query: Option<&str>, json: bool) -> anyhow::Result<()> {
     let idx_path = backend.repos_dir().join("index.json");
     if !idx_path.exists() {
-        println!("No local index. Run `mpkg update` first.");
+        if !json {
+            println!("No local index. Run `mpkg update` first.");
+        } else {
+            #[derive(serde::Serialize)]
+            struct ErrOut { error: String }
+            println!("{}", serde_json::to_string(&ErrOut { error: "no local index; run `mpkg update` first".into() })?);
+        }
         return Ok(());
     }
     let trusted_keys = mpkg_core::repo::load_trusted_keys(&backend.repos_dir().join("trusted-keys")).await?;
@@ -247,25 +353,44 @@ async fn search_repo(backend: &FsBackend, query: Option<&str>) -> anyhow::Result
     matches.sort_by(|a, b| a.name.cmp(&b.name));
 
     if matches.is_empty() {
-        println!("No packages matched.");
+        if !json {
+            println!("No packages matched.");
+        } else {
+            #[derive(serde::Serialize)]
+            struct Out { packages: Vec<String> }
+            println!("{}", serde_json::to_string(&Out { packages: vec![] })?);
+        }
     } else {
-        println!("Packages:");
-        for e in matches {
-            println!(
-                "  {} v{} - {}",
-                e.name,
-                e.version,
-                e.description.as_deref().unwrap_or("")
-            );
+        if !json {
+            println!("Packages:");
+            for e in &matches {
+                println!(
+                    "  {} v{} - {}",
+                    e.name,
+                    e.version,
+                    e.description.as_deref().unwrap_or("")
+                );
+            }
+        } else {
+            #[derive(serde::Serialize)]
+            struct Out { packages: Vec<(String, String, Option<String>)> }
+            let out: Vec<_> = matches.iter().map(|e| (e.name.clone(), e.version.clone(), e.description.clone())).collect();
+            println!("{}", serde_json::to_string(&Out { packages: out })?);
         }
     }
     Ok(())
 }
 
-async fn info_repo(backend: &FsBackend, name: String) -> anyhow::Result<()> {
+async fn info_repo(backend: &FsBackend, name: &str, json: bool) -> anyhow::Result<()> {
     let idx_path = backend.repos_dir().join("index.json");
     if !idx_path.exists() {
-        println!("No local index. Run `mpkg update` first.");
+        if !json {
+            println!("No local index. Run `mpkg update` first.");
+        } else {
+            #[derive(serde::Serialize)]
+            struct ErrOut { error: String }
+            println!("{}", serde_json::to_string(&ErrOut { error: "no local index; run `mpkg update` first".into() })?);
+        }
         return Ok(());
     }
     let trusted_keys = mpkg_core::repo::load_trusted_keys(&backend.repos_dir().join("trusted-keys")).await?;
@@ -273,17 +398,46 @@ async fn info_repo(backend: &FsBackend, name: String) -> anyhow::Result<()> {
         .await
         .context("failed to load/verify index")?;
 
-    if let Some(entry) = idx.packages.get(name.as_str()) {
-        println!("Package: {}", entry.name);
-        println!("Version: {}", entry.version);
-        println!("Archive: {}", entry.archive);
-        println!("Size: {} bytes", entry.size);
-        println!("SHA256: {}", entry.sha256);
-        println!("Deps: {}", entry.deps.join(", "));
-        if !entry.manifest.is_empty() {
-            println!("Manifest:\n{}", entry.manifest);
+    if let Some(entry) = idx.packages.get(name) {
+        if !json {
+            println!("Package: {}", entry.name);
+            println!("Version: {}", entry.version);
+            println!("Archive: {}", entry.archive);
+            println!("Size: {} bytes", entry.size);
+            println!("SHA256: {}", entry.sha256);
+            println!("Deps: {}", entry.deps.join(", "));
+            if !entry.manifest.is_empty() {
+                println!("Manifest:\n{}", entry.manifest);
+            }
+        } else {
+            #[derive(serde::Serialize)]
+            struct Out {
+                name: String,
+                version: String,
+                archive: String,
+                size: u64,
+                sha256: String,
+                deps: Vec<String>,
+                manifest: String,
+            }
+            println!("{}", serde_json::to_string(&Out {
+                name: entry.name.clone(),
+                version: entry.version.clone(),
+                archive: entry.archive.clone(),
+                size: entry.size,
+                sha256: entry.sha256.clone(),
+                deps: entry.deps.clone(),
+                manifest: entry.manifest.clone(),
+            })?);
         }
     } else {
-        println!("Package '{}' not found.", name);
+        if !json {
+            println!("Package '{}' not found.", name);
+        } else {
+            #[derive(serde::Serialize)]
+            struct ErrOut { error: String }
+            println!("{}", serde_json::to_string(&ErrOut { error: format!("package '{}' not found", name) })?);
+        }
     }
     Ok(())
+}
